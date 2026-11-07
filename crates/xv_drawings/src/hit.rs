@@ -8,6 +8,21 @@ pub trait Projector {
     fn to_anchor(&self, p: (f32, f32)) -> Anchor;
     fn width(&self) -> f32;
     fn height(&self) -> f32;
+
+    /// Moves an anchor by a screen offset. An axis with a zero offset is left
+    /// exactly untouched, so a drag along one axis cannot disturb the other.
+    fn shift_anchor(&self, a: Anchor, dx: f32, dy: f32) -> Anchor {
+        let moved = if dx == 0.0 && dy == 0.0 {
+            a
+        } else {
+            let s = self.to_screen(a);
+            self.to_anchor((s.0 + dx, s.1 + dy))
+        };
+        Anchor {
+            time_ms: if dx == 0.0 { a.time_ms } else { moved.time_ms },
+            price: if dy == 0.0 { a.price } else { moved.price },
+        }
+    }
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -133,10 +148,7 @@ pub fn hit_test(ds: &[Drawing], p: Pt, proj: &dyn Projector) -> Option<(DrawingI
 impl Drawing {
     /// Moves the drawing by a screen-space offset.
     pub fn translated(&self, dx: f32, dy: f32, proj: &dyn Projector) -> Drawing {
-        let mv = |a: Anchor| {
-            let s = proj.to_screen(a);
-            proj.to_anchor((s.0 + dx, s.1 + dy))
-        };
+        let mv = |a: Anchor| proj.shift_anchor(a, dx, dy);
         let kind = match &self.kind {
             DrawingKind::TrendLine { a, b } => DrawingKind::TrendLine {
                 a: mv(*a),
@@ -150,26 +162,30 @@ impl Drawing {
                 a: mv(*a),
                 b: mv(*b),
             },
-            DrawingKind::HorizontalLine { price } => {
-                let y = proj
-                    .to_screen(Anchor {
-                        time_ms: 0,
-                        price: *price,
-                    })
-                    .1;
-                let back = proj.to_anchor((proj.width() / 2.0, y + dy));
-                DrawingKind::HorizontalLine { price: back.price }
-            }
-            DrawingKind::VerticalLine { time_ms } => {
-                let s = proj.to_screen(Anchor {
-                    time_ms: *time_ms,
-                    price: 0.0,
-                });
-                let back = proj.to_anchor((s.0 + dx, s.1));
-                DrawingKind::VerticalLine {
-                    time_ms: back.time_ms,
-                }
-            }
+            DrawingKind::HorizontalLine { price } => DrawingKind::HorizontalLine {
+                price: proj
+                    .shift_anchor(
+                        Anchor {
+                            time_ms: 0,
+                            price: *price,
+                        },
+                        0.0,
+                        dy,
+                    )
+                    .price,
+            },
+            DrawingKind::VerticalLine { time_ms } => DrawingKind::VerticalLine {
+                time_ms: proj
+                    .shift_anchor(
+                        Anchor {
+                            time_ms: *time_ms,
+                            price: 0.0,
+                        },
+                        dx,
+                        0.0,
+                    )
+                    .time_ms,
+            },
         };
         Drawing {
             id: self.id,
@@ -343,6 +359,73 @@ mod tests {
             hit_test(&[v], (53.0, 10.0), &P),
             Some((DrawingId(2), Hit::Body))
         );
+    }
+
+    /// Time mapping that snaps to 10 s steps (lossy), like a gap snapping to a bar.
+    struct Snap;
+    impl Projector for Snap {
+        fn to_screen(&self, a: Anchor) -> (f32, f32) {
+            (a.time_ms as f32 / 1000.0, 1000.0 - a.price as f32)
+        }
+        fn to_anchor(&self, p: (f32, f32)) -> Anchor {
+            Anchor {
+                time_ms: (p.0 / 10.0).round() as i64 * 10_000,
+                price: (1000.0 - p.1) as f64,
+            }
+        }
+        fn width(&self) -> f32 {
+            800.0
+        }
+        fn height(&self) -> f32 {
+            600.0
+        }
+    }
+
+    #[test]
+    fn translate_zero_is_identity() {
+        let a = Anchor {
+            time_ms: 1_700_000_123_457,
+            price: 123.456789,
+        };
+        for kind in [
+            DrawingKind::TrendLine { a, b: a },
+            DrawingKind::Ray { a, b: a },
+            DrawingKind::Rectangle { a, b: a },
+            DrawingKind::HorizontalLine { price: a.price },
+            DrawingKind::VerticalLine { time_ms: a.time_ms },
+        ] {
+            let dr = d(1, kind);
+            assert_eq!(dr.translated(0.0, 0.0, &P), dr);
+        }
+    }
+
+    #[test]
+    fn vertical_only_drag_keeps_time() {
+        let a = Anchor {
+            time_ms: 123_457,
+            price: 500.0,
+        };
+        let b = Anchor {
+            time_ms: 987_654,
+            price: 400.0,
+        };
+        let dr = d(1, DrawingKind::TrendLine { a, b });
+        let m = dr.translated(0.0, 10.0, &Snap);
+        assert_eq!(
+            m.kind,
+            DrawingKind::TrendLine {
+                a: Anchor {
+                    time_ms: a.time_ms,
+                    price: 490.0
+                },
+                b: Anchor {
+                    time_ms: b.time_ms,
+                    price: 390.0
+                },
+            }
+        );
+        let v = d(2, DrawingKind::VerticalLine { time_ms: 123_457 });
+        assert_eq!(v.translated(0.0, 50.0, &Snap), v);
     }
 
     #[test]

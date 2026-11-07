@@ -133,7 +133,11 @@ impl Viewport {
     }
 
     pub fn is_following(&self, len: usize) -> bool {
-        len > 0 && self.x_of_index((len - 1) as f64) <= self.width
+        if len == 0 {
+            return false;
+        }
+        let x = self.x_of_index((len - 1) as f64);
+        (0.0..=self.width).contains(&x)
     }
 }
 
@@ -219,6 +223,10 @@ mod tests {
         let r = v.visible_range(100);
         assert!(r.start <= 40 && r.end >= 50 && r.end <= 100);
         assert_eq!(v.visible_range(0), 0..0);
+        v.right_index = 99.0 - 20.0;
+        assert!(!v.is_following(100)); // last bar beyond the right edge
+        v.right_index = 99.0 + 50.0;
+        assert!(!v.is_following(100)); // last bar off the left edge
     }
 
     #[test]
