@@ -14,3 +14,10 @@ xv_drawings = { path = "../xv_drawings" }
 xv_chart = { path = "../xv_chart" }
 xv_core = { path = "../xv_core" }
 xv_store = { path = "../xv_store" }
+xv_data = { path = "../xv_data" }
+xv_source_binance = { path = "../xv_source_binance" }
+xv_source_csv = { path = "../xv_source_csv" }
+futures.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

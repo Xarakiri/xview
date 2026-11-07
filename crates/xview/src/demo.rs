@@ -1,6 +1,7 @@
-//! Temporary demo data for the chart view (replaced by real loading in Task 15).
+//! Offline demo data source, used instead of Binance when `XVIEW_DEMO=1`.
 //!
 //! Environment knobs:
+//! - `XVIEW_DEMO=1`: register the demo source first and start on its symbol.
 //! - `XVIEW_DEMO_CANDLES=N`: number of generated 1m candles (default 5,000).
 //! - `XVIEW_DEMO_BAR_SPACING=PX`: initial bar spacing (e.g. 0.6 shows ~2,000
 //!   bars in a 1280 px window).
@@ -9,9 +10,13 @@
 
 use std::time::Duration;
 
+use futures::FutureExt;
+use futures::future::BoxFuture;
+use futures::stream::BoxStream;
 use gpui::{Context, Entity};
 use xv_chart::Mods;
-use xv_core::{Candle, Series, SourceId, Symbol, Timeframe};
+use xv_core::{Candle, SourceId, Symbol, Timeframe, TzOffset, resample};
+use xv_data::{CandleUpdate, DataError, DataSource, HistoryPage};
 
 use crate::chart_view::ChartView;
 
@@ -19,6 +24,12 @@ pub const DEFAULT_CANDLES: usize = 5_000;
 
 fn env_parse<T: std::str::FromStr>(name: &str) -> Option<T> {
     std::env::var(name).ok()?.trim().parse().ok()
+}
+
+pub const DEMO_SOURCE_ID: &str = "demo";
+
+pub fn enabled() -> bool {
+    std::env::var_os("XVIEW_DEMO").is_some_and(|v| !v.is_empty() && v != "0")
 }
 
 pub fn candle_count() -> usize {
@@ -78,17 +89,77 @@ pub fn candles(n: usize) -> Vec<Candle> {
         .collect()
 }
 
-pub fn series(n: usize) -> Series {
-    let symbol = Symbol {
-        source: SourceId("demo".into()),
+pub fn symbol() -> Symbol {
+    Symbol {
+        source: SourceId(DEMO_SOURCE_ID.into()),
         id: "DEMO".into(),
         display: "DEMOUSD".into(),
         description: "Generated random walk".into(),
         base: "DEMO".into(),
         quote: "USD".into(),
         tick_size: 0.01,
-    };
-    Series::new(symbol, Timeframe::M1, candles(n), false)
+    }
+}
+
+/// Serves the generated 1m random walk, resampled (UTC) to every timeframe.
+pub struct DemoSource {
+    base: Vec<Candle>,
+}
+
+impl DemoSource {
+    pub fn new() -> Self {
+        DemoSource {
+            base: candles(candle_count()),
+        }
+    }
+}
+
+impl DataSource for DemoSource {
+    fn id(&self) -> SourceId {
+        SourceId(DEMO_SOURCE_ID.into())
+    }
+
+    fn name(&self) -> &str {
+        "Demo"
+    }
+
+    fn search_symbols(&self, query: &str) -> BoxFuture<'static, Result<Vec<Symbol>, DataError>> {
+        let s = symbol();
+        let hit = s.display.to_lowercase().contains(&query.trim().to_lowercase());
+        futures::future::ready(Ok(if hit { vec![s] } else { vec![] })).boxed()
+    }
+
+    fn supported_timeframes(&self, _symbol: &Symbol) -> Vec<Timeframe> {
+        Timeframe::ALL.to_vec()
+    }
+
+    fn history(
+        &self,
+        _symbol: &Symbol,
+        tf: Timeframe,
+        end_before_ms: Option<i64>,
+        limit: usize,
+    ) -> BoxFuture<'static, Result<HistoryPage, DataError>> {
+        let all = if tf == Timeframe::M1 {
+            self.base.clone()
+        } else {
+            resample(&self.base, tf, TzOffset::UTC)
+        };
+        let end = match end_before_ms {
+            Some(t) => all.partition_point(|c| c.open_time_ms < t),
+            None => all.len(),
+        };
+        let start = end.saturating_sub(limit);
+        let page = HistoryPage {
+            candles: all[start..end].to_vec(),
+            has_more: start > 0,
+        };
+        futures::future::ready(Ok(page)).boxed()
+    }
+
+    fn subscribe(&self, _symbol: &Symbol, _tf: Timeframe) -> Option<BoxStream<'static, CandleUpdate>> {
+        None
+    }
 }
 
 /// Pans 300 frames one way, then back, forever.

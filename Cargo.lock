@@ -6551,12 +6551,17 @@ name = "xview"
 version = "0.1.0"
 dependencies = [
  "chrono",
+ "futures",
  "gpui",
  "gpui_platform",
  "gpui_tokio",
+ "tempfile",
  "xv_chart",
  "xv_core",
+ "xv_data",
  "xv_drawings",
+ "xv_source_binance",
+ "xv_source_csv",
  "xv_store",
 ]
 

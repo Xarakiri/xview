@@ -10,7 +10,7 @@ use std::{
 
 use gpui::{
     App, Bounds, ContentMask, Context, DispatchPhase, EventEmitter, FocusHandle, Focusable, Font,
-    FontWeight, Hitbox, HitboxBehavior, Hsla, KeyBinding, Modifiers, MouseButton, MouseDownEvent,
+    FontWeight, Hitbox, HitboxBehavior, Hsla, KeyBinding, KeyDownEvent, Keystroke, Modifiers, MouseButton, MouseDownEvent,
     MouseExitEvent, MouseMoveEvent, MouseUpEvent, PathBuilder, PinchEvent, Pixels, Point, Render,
     ScrollDelta, ScrollEvent, SharedString, Subscription, TextRun, Window, actions, canvas, div,
     fill, point, prelude::*, px, quad, size, transparent_black,
@@ -19,7 +19,7 @@ use xv_chart::{
     ChartColors, ChartEffect, ChartKey, ChartLayout, ChartState, Frame, Legend, Mods, Prim, RectF,
     TextAlign,
 };
-use xv_core::Series;
+use xv_core::{Candle, Series};
 
 use crate::theme::u32_to_hsla;
 
@@ -64,6 +64,9 @@ pub enum ChartViewEvent {
     DrawingsChanged,
     ToolFinished,
     SelectionChanged,
+    /// A letter was typed while the chart had focus: open the symbol search
+    /// pre-filled with it.
+    TypeToSearch(String),
 }
 
 pub struct ChartView {
@@ -119,15 +122,46 @@ impl ChartView {
         }
     }
 
-    // Called by the loader (Task 15) and the theme toggle (Task 14).
-    #[allow(dead_code)]
+    /// Replaces the series (the loader landed a new symbol or timeframe).
     pub fn set_series(&mut self, s: Series, cx: &mut Context<Self>) {
         self.dragging = false;
         self.state.set_series(s);
+        // A wide window may already show the left edge of the first page.
+        let fx = self.state.check_need_older();
+        self.apply_effects(fx, cx);
+    }
+
+    pub fn set_source_name(&mut self, name: impl Into<SharedString>, cx: &mut Context<Self>) {
+        let name = name.into();
+        if name != self.source_name {
+            self.source_name = name;
+            cx.notify();
+        }
+    }
+
+    pub fn prepend_older(&mut self, cs: Vec<Candle>, has_more: bool, cx: &mut Context<Self>) {
+        self.state.prepend_older(cs, has_more);
+        // Keep fetching while the page still does not fill the window.
+        let fx = self.state.check_need_older();
+        self.apply_effects(fx, cx);
+    }
+
+    pub fn older_failed(&mut self, cx: &mut Context<Self>) {
+        self.state.older_failed();
         cx.notify();
     }
 
-    #[allow(dead_code)]
+    pub fn apply_update(&mut self, c: Candle, cx: &mut Context<Self>) {
+        self.state.apply_update(c);
+        cx.notify();
+    }
+
+    pub fn merge_backfill(&mut self, cs: Vec<Candle>, cx: &mut Context<Self>) {
+        self.state.merge_backfill(cs);
+        let fx = self.state.check_need_older();
+        self.apply_effects(fx, cx);
+    }
+
     pub fn set_colors(&mut self, colors: ChartColors, cx: &mut Context<Self>) {
         self.colors = colors;
         cx.notify();
@@ -178,6 +212,21 @@ impl ChartView {
     }
 }
 
+/// The letter that opens the symbol search when typed on the chart, or `None`
+/// for anything else (shortcuts with cmd/ctrl/alt/fn, digits, named keys).
+pub fn type_to_search_letter(k: &Keystroke) -> Option<String> {
+    let m = &k.modifiers;
+    if m.platform || m.control || m.alt || m.function {
+        return None;
+    }
+    let ch = k.key_char.as_deref()?;
+    let mut chars = ch.chars();
+    match (chars.next(), chars.next()) {
+        (Some(c), None) if c.is_alphabetic() => Some(ch.to_string()),
+        _ => None,
+    }
+}
+
 fn mods(m: &Modifiers) -> Mods {
     Mods {
         shift: m.shift,
@@ -213,6 +262,12 @@ impl Render for ChartView {
             .on_action(cx.listener(|this, _: &Cancel, _, cx| this.key(ChartKey::Escape, cx)))
             .on_action(cx.listener(|this, _: &Undo, _, cx| this.key(ChartKey::Undo, cx)))
             .on_action(cx.listener(|this, _: &Redo, _, cx| this.key(ChartKey::Redo, cx)))
+            .on_key_down(cx.listener(|_, e: &KeyDownEvent, _, cx| {
+                if let Some(letter) = type_to_search_letter(&e.keystroke) {
+                    cx.stop_propagation();
+                    cx.emit(ChartViewEvent::TypeToSearch(letter));
+                }
+            }))
             .size_full()
             .child(
                 canvas(
@@ -734,5 +789,43 @@ impl FrameStats {
             );
             *self = FrameStats::default();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ks(key: &str, ch: Option<&str>, m: Modifiers) -> Keystroke {
+        Keystroke {
+            modifiers: m,
+            key: key.into(),
+            key_char: ch.map(Into::into),
+        }
+    }
+
+    #[test]
+    fn letters_open_search_but_shortcuts_do_not() {
+        let none = Modifiers::default();
+        assert_eq!(type_to_search_letter(&ks("e", Some("e"), none)), Some("e".into()));
+        let shift = Modifiers {
+            shift: true,
+            ..Default::default()
+        };
+        assert_eq!(type_to_search_letter(&ks("e", Some("E"), shift)), Some("E".into()));
+        let cmd = Modifiers {
+            platform: true,
+            ..Default::default()
+        };
+        assert_eq!(type_to_search_letter(&ks("k", None, cmd)), None);
+        assert_eq!(type_to_search_letter(&ks("k", Some("k"), cmd)), None);
+        let ctrl = Modifiers {
+            control: true,
+            ..Default::default()
+        };
+        assert_eq!(type_to_search_letter(&ks("a", Some("a"), ctrl)), None);
+        assert_eq!(type_to_search_letter(&ks("1", Some("1"), none)), None);
+        assert_eq!(type_to_search_letter(&ks("escape", None, none)), None);
+        assert_eq!(type_to_search_letter(&ks("space", Some(" "), none)), None);
     }
 }

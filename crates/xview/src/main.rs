@@ -1,19 +1,39 @@
 mod assets;
 mod bottom_bar;
 mod chart_view;
+mod debug_script;
 mod demo;
 mod left_toolbar;
+mod loader;
+mod persistence;
 mod side_panel;
 mod style_bar;
+mod symbol_search;
 mod theme;
 mod top_bar;
 mod widgets;
 mod workspace;
 
-use gpui::{App, Bounds, WindowBounds, WindowOptions, prelude::*, px, size};
-use gpui_platform::application;
+use std::sync::Arc;
 
-use workspace::Workspace;
+use gpui::{
+    App, Bounds, Menu, MenuItem, WindowBounds, WindowOptions, point, prelude::*, px, size,
+};
+use gpui_platform::application;
+use xv_data::SourceRegistry;
+use xv_source_binance::BinanceSource;
+use xv_source_csv::CsvSource;
+use xv_store::{data_dir, load_settings};
+
+use workspace::{Boot, OpenCsv, Quit, ToggleTheme, Workspace, rect_of, rect_visible};
+
+fn set_menus(cx: &mut App) {
+    cx.set_menus([
+        Menu::new("XView").items([MenuItem::action("Quit XView", Quit)]),
+        Menu::new("File").items([MenuItem::action("Open CSV…", OpenCsv)]),
+        Menu::new("View").items([MenuItem::action("Toggle Theme", ToggleTheme)]),
+    ]);
+}
 
 fn main() {
     application()
@@ -22,7 +42,35 @@ fn main() {
             gpui_tokio::init(cx);
             chart_view::bind_keys(cx);
             workspace::bind_keys(cx);
-            let bounds = Bounds::centered(None, size(px(1280.), px(800.)), cx);
+            cx.on_action(|_: &Quit, cx| cx.quit());
+            set_menus(cx);
+
+            let dir = data_dir();
+            let settings = load_settings(&dir);
+            let csv = Arc::new(CsvSource::new());
+            let mut registry = SourceRegistry::new();
+            if demo::enabled() {
+                registry.add(Arc::new(demo::DemoSource::new()));
+            }
+            // Binance first: the registry's default source.
+            registry.add(Arc::new(BinanceSource::new()));
+            registry.add(csv.clone());
+
+            let displays: Vec<_> = cx.displays().iter().map(|d| rect_of(d.bounds())).collect();
+            let bounds = settings
+                .window
+                .filter(|r| rect_visible(r, &displays))
+                .map(|r| Bounds {
+                    origin: point(px(r.x), px(r.y)),
+                    size: size(px(r.w), px(r.h)),
+                })
+                .unwrap_or_else(|| Bounds::centered(None, size(px(1280.), px(800.)), cx));
+            let boot = Boot {
+                dir,
+                settings,
+                registry,
+                csv,
+            };
             cx.open_window(
                 WindowOptions {
                     window_bounds: Some(WindowBounds::Windowed(bounds)),
@@ -32,7 +80,7 @@ fn main() {
                     }),
                     ..Default::default()
                 },
-                |window, cx| cx.new(|cx| Workspace::new(window, cx)),
+                |window, cx| cx.new(|cx| Workspace::new(boot, window, cx)),
             )
             .unwrap();
             cx.on_window_closed(|cx, _| cx.quit()).detach();

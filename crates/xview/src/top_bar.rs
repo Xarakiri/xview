@@ -9,7 +9,7 @@ use xv_core::{Symbol, Timeframe};
 
 use crate::theme::{AppTheme, u32_to_hsla};
 use crate::widgets::{
-    TOOLTIP_COMING_SOON, icon, icon_button, menu_box, menu_row, popover_layer, tooltip, vsep,
+    DISABLED_OPACITY, TOOLTIP_COMING_SOON, icon, icon_button, menu_box, menu_row, popover_layer, tooltip, vsep,
 };
 use crate::workspace::{OpenSymbolSearch, REGION_BORDER, SelectTimeframe, TOP_BAR_HEIGHT};
 
@@ -28,6 +28,8 @@ pub struct TopBar {
     theme: AppTheme,
     symbol: SharedString,
     timeframe: Timeframe,
+    /// Timeframes the current source offers; the others render disabled.
+    supported: Vec<Timeframe>,
     menu: Option<Menu>,
 }
 
@@ -53,7 +55,15 @@ impl TopBar {
             theme,
             symbol: symbol.display.clone().into(),
             timeframe,
+            supported: Timeframe::ALL.to_vec(),
             menu: None,
+        }
+    }
+
+    pub fn set_supported(&mut self, supported: Vec<Timeframe>, cx: &mut Context<Self>) {
+        if supported != self.supported {
+            self.supported = supported;
+            cx.notify();
         }
     }
 
@@ -150,8 +160,9 @@ impl TopBar {
     fn timeframe_button(&self, tf: Timeframe) -> impl IntoElement {
         let t = &self.theme;
         let active = tf == self.timeframe;
+        let enabled = self.supported.contains(&tf);
         let hover = t.hover;
-        div()
+        let button = div()
             .id(SharedString::from(format!("tf-{}", tf.label())))
             .flex()
             .flex_none()
@@ -163,8 +174,14 @@ impl TopBar {
             .rounded(px(6.))
             .text_size(px(16.))
             .when(active, |d| d.bg(t.active_bg))
+            .child(tf.label());
+        if !enabled {
+            return button
+                .opacity(DISABLED_OPACITY)
+                .tooltip(tooltip("Not available for this symbol", t));
+        }
+        button
             .when(!active, |d| d.hover(move |s| s.bg(hover)))
-            .child(tf.label())
             .on_click(move |_, window, cx| {
                 window.dispatch_action(Box::new(SelectTimeframe(tf)), cx)
             })
@@ -202,20 +219,23 @@ impl TopBar {
         let t = &self.theme;
         let mut menu = menu_box(t);
         for tf in Timeframe::ALL {
-            menu = menu.child(
-                menu_row(
-                    SharedString::from(format!("tf-menu-{}", tf.label())),
-                    None,
-                    long_name(tf),
-                    tf == self.timeframe,
-                    true,
-                    t,
-                )
-                .on_click(cx.listener(move |this, _, window, cx| {
+            let enabled = self.supported.contains(&tf);
+            let row = menu_row(
+                SharedString::from(format!("tf-menu-{}", tf.label())),
+                None,
+                long_name(tf),
+                tf == self.timeframe,
+                enabled,
+                t,
+            );
+            menu = menu.child(if enabled {
+                row.on_click(cx.listener(move |this, _, window, cx| {
                     this.close_menu(cx);
                     window.dispatch_action(Box::new(SelectTimeframe(tf)), cx);
-                })),
-            );
+                }))
+            } else {
+                row
+            });
         }
         menu
     }

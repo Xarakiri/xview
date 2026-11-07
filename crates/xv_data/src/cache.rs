@@ -44,6 +44,11 @@ impl SeriesCache {
         })
     }
 
+    /// Drops every timeframe of `key` (e.g. a CSV file that was reloaded).
+    pub fn remove_symbol(&mut self, key: &SymbolKey) {
+        self.map.retain(|(k, _), _| k != key);
+    }
+
     /// Inserts (or replaces) a series, evicting the least recently used one when full.
     pub fn insert(&mut self, series: Series) {
         let key = (series.symbol.key(), series.timeframe);
@@ -90,6 +95,19 @@ mod tests {
         assert!(c.get(&keys[0], Timeframe::M1).is_some());
         assert!(c.get(&keys[1], Timeframe::M1).is_none());
         assert!(c.get(&keys[32], Timeframe::M1).is_some());
+    }
+
+    #[test]
+    fn remove_symbol_drops_all_timeframes() {
+        let mut c = SeriesCache::new();
+        let s = series(0);
+        let key = s.symbol.key();
+        c.insert(s.clone());
+        c.insert(Series::new(s.symbol.clone(), Timeframe::H1, vec![], false));
+        c.insert(series(1));
+        c.remove_symbol(&key);
+        assert_eq!(c.len(), 1);
+        assert!(c.get(&key, Timeframe::H1).is_none());
     }
 
     #[test]

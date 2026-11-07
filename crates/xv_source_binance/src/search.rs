@@ -3,7 +3,7 @@ use xv_core::Symbol;
 const QUOTE_PRIORITY: [&str; 4] = ["USDT", "USDC", "FDUSD", "BTC"];
 const MAX_RESULTS: usize = 50;
 
-/// Case-insensitive ranking: exact id, id prefix, base prefix, id contains; ties by quote
+/// Case-insensitive ranking: exact id, exact base, id prefix, base prefix, id contains; ties by quote
 /// priority, then alphabetically. At most 50 results.
 pub fn rank_search(symbols: &[Symbol], q: &str) -> Vec<Symbol> {
     let q = q.trim().to_uppercase();
@@ -11,14 +11,17 @@ pub fn rank_search(symbols: &[Symbol], q: &str) -> Vec<Symbol> {
         .iter()
         .filter_map(|s| {
             let id = s.id.to_uppercase();
+            let base = s.base.to_uppercase();
             let tier = if id == q {
                 0
-            } else if id.starts_with(&q) {
+            } else if base == q {
                 1
-            } else if s.base.to_uppercase().starts_with(&q) {
+            } else if id.starts_with(&q) {
                 2
-            } else if id.contains(&q) {
+            } else if base.starts_with(&q) {
                 3
+            } else if id.contains(&q) {
+                4
             } else {
                 return None;
             };
@@ -60,8 +63,13 @@ mod tests {
             sym("SETHUSDT", "SETH", "USDT"),
             sym("BTCUSDT", "BTC", "USDT"),
             sym("WBETHETH", "WBETH", "ETH"),
+            sym("ETHFIUSDT", "ETHFI", "USDT"),
         ];
-        assert_eq!(ids(&rank_search(&syms, "eth")), ["ETHUSDT", "ETHBTC", "SETHUSDT", "WBETHETH"]);
+        // The exact base outranks longer ids that merely start with the query.
+        assert_eq!(
+            ids(&rank_search(&syms, "eth")),
+            ["ETHUSDT", "ETHBTC", "ETHFIUSDT", "SETHUSDT", "WBETHETH"]
+        );
         assert_eq!(ids(&rank_search(&syms, "ethusdt")), ["ETHUSDT", "SETHUSDT"]);
         assert_eq!(ids(&rank_search(&syms, "BTC")), ["BTCUSDT", "ETHBTC"]);
     }
