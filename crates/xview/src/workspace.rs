@@ -45,6 +45,11 @@ pub const RAIL_WIDTH: f32 = 44.;
 /// Thick panel-gray borders between the shell regions.
 pub const REGION_BORDER: f32 = 4.;
 pub const BANNER_HEIGHT: f32 = 36.;
+/// Smallest window content size: leaves a plot of at least ~420 × 400 px
+/// beside the fixed tool column, side panel and price axis, with a banner up
+/// (see the `min_window_keeps_a_usable_plot` test).
+pub const MIN_WINDOW_WIDTH: f32 = 900.;
+pub const MIN_WINDOW_HEIGHT: f32 = 560.;
 const MAX_BANNERS: usize = 5;
 /// Window moves and resizes are saved this long after the last change.
 const BOUNDS_SAVE_DEBOUNCE: Duration = Duration::from_millis(500);
@@ -1321,6 +1326,21 @@ mod tests {
             "Drawings for BTCUSDT were unreadable; the file was kept at /d/drawings/binance/BTCUSDT-1.json.corrupt-1"
         );
         assert!(corrupt_drawings_text(&default_symbol(), p, false).contains("could not be moved aside"));
+    }
+
+    #[test]
+    fn min_window_keeps_a_usable_plot() {
+        let plot_w = MIN_WINDOW_WIDTH
+            - LEFT_TOOLBAR_WIDTH
+            - (SIDE_PANEL_WIDTH + RAIL_WIDTH + 2. * REGION_BORDER)
+            - xv_chart::PRICE_AXIS_WIDTH;
+        let plot_h = MIN_WINDOW_HEIGHT
+            - (TOP_BAR_HEIGHT + REGION_BORDER)
+            - BANNER_HEIGHT
+            - BOTTOM_BAR_HEIGHT
+            - xv_chart::TIME_AXIS_HEIGHT;
+        assert!(plot_w >= 300., "{plot_w}");
+        assert!(plot_h >= 300., "{plot_h}");
     }
 
     #[test]

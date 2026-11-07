@@ -215,6 +215,15 @@ impl Out {
 const BODY_FRACTION: f32 = 0.8;
 const THIN_BAR_SPACING: f32 = 2.0;
 const AXIS_LABEL_PAD: f32 = 8.0;
+/// Height of a boxed axis label (last price, crosshair), centered on its y.
+/// Plain tick labels within this distance of one are hidden under it.
+pub const AXIS_LABEL_HEIGHT: f32 = 18.0;
+
+/// Whether a tick label at `y` would collide with a boxed label at one of
+/// `boxed` (all plot coordinates).
+fn hidden_by_boxed_label(y: f32, boxed: &[f32]) -> bool {
+    boxed.iter().any(|b| (y - b).abs() < AXIS_LABEL_HEIGHT)
+}
 
 fn with_alpha(color: u32, alpha: u8) -> u32 {
     (color & 0xFFFF_FF00) | alpha as u32
@@ -324,11 +333,27 @@ pub fn build_frame(i: &FrameInput) -> Frame {
     let mut price_axis = Out(Vec::new());
     let mut time_axis = Out(Vec::new());
 
+    // Boxed price-axis labels drawn later: the last price and the crosshair.
+    let crosshair = i
+        .crosshair
+        .map(|(x, y)| (x - ox, y - oy))
+        .filter(|(cx, cy)| (0.0..=pw).contains(cx) && (0.0..=ph).contains(cy));
+    let boxed: Vec<f32> = candles
+        .last()
+        .map(|c| vp.y_of_price(c.close))
+        .filter(|y| (0.0..=ph).contains(y))
+        .into_iter()
+        .chain(crosshair.map(|(_, cy)| cy))
+        .collect();
+
     // Grid and axis tick labels.
     for v in price_ticks(vp.price, vp.height, tick) {
         let y = vp.y_of_price(v);
         if (0.0..=ph).contains(&y) {
             plot.line((0.0, y), (pw, y), colors.grid, 1.0, false);
+            if hidden_by_boxed_label(y, &boxed) {
+                continue;
+            }
             price_axis.text(
                 (label_x, oy + y),
                 format_price(v, tick),
@@ -442,10 +467,7 @@ pub fn build_frame(i: &FrameInput) -> Frame {
 
     // Crosshair (input is in chart element coordinates).
     let mut hover_idx = None;
-    if let Some((cx, cy)) = i.crosshair.map(|(x, y)| (x - ox, y - oy))
-        && (0.0..=pw).contains(&cx)
-        && (0.0..=ph).contains(&cy)
-    {
+    if let Some((cx, cy)) = crosshair {
         let idx = vp.index_of_x(cx).round();
         let sx = vp.x_of_index(idx);
         if (0.0..candles.len() as f64).contains(&idx) {
@@ -896,6 +918,64 @@ mod tests {
                 .iter()
                 .any(|p| matches!(p, Prim::Handle { .. } | Prim::StrokeRect { .. }))
         );
+    }
+
+    #[test]
+    fn tick_labels_under_last_price_and_crosshair_labels_are_hidden() {
+        let cs: Vec<Candle> = (0..50)
+            .map(|i| Candle {
+                open_time_ms: T0 + i * H,
+                open: 99.0,
+                high: 101.0,
+                low: 98.0,
+                close: 100.0,
+                volume: 1.0,
+            })
+            .collect();
+        let s = series(cs);
+        let layout = ChartLayout::new(1000.0, 600.0);
+        let mut vp = Viewport::new(layout.plot.w, layout.plot.h);
+        fit(&mut vp, &s);
+        vp.price = PriceRange { min: 50.0, max: 150.0 };
+        vp.auto_scale = false;
+        let plain = |f: &Frame| -> Vec<String> {
+            f.price_axis
+                .iter()
+                .filter_map(|p| match p {
+                    Prim::Text { text, bg: None, .. } => Some(text.clone()),
+                    _ => None,
+                })
+                .collect()
+        };
+        let boxed = |f: &Frame| -> Vec<String> {
+            f.price_axis
+                .iter()
+                .filter_map(|p| match p {
+                    Prim::Text { text, bg: Some(_), .. } => Some(text.clone()),
+                    _ => None,
+                })
+                .collect()
+        };
+        // Ticks every 20: the 100.00 tick sits under the last-price label.
+        let f = run(&s, &vp, &layout, |_| {});
+        let mut ticks = plain(&f);
+        ticks.sort();
+        assert_eq!(ticks, ["120.00", "140.00", "60.00", "80.00"]);
+        assert_eq!(boxed(&f), ["100.00"]);
+        // A crosshair 5 px below the 120 tick hides it too.
+        let y120 = vp.y_of_price(120.0);
+        let f = run(&s, &vp, &layout, |i| i.crosshair = Some((300.0, y120 + 5.0)));
+        let mut ticks = plain(&f);
+        ticks.sort();
+        assert_eq!(ticks, ["140.00", "60.00", "80.00"]);
+        assert_eq!(boxed(&f).len(), 2);
+        // Grid lines stay.
+        let grid = f
+            .plot
+            .iter()
+            .filter(|p| matches!(p, Prim::Line { a, b, .. } if a.1 == b.1 && (a.1 - y120).abs() < 0.01))
+            .count();
+        assert!(grid >= 1);
     }
 
     #[test]

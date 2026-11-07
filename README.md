@@ -57,8 +57,9 @@ Panning left past the loaded data fetches older history automatically.
 The default source is Binance public market data (no account or API key). XView
 tries `data-api.binance.vision` first and falls back to `api.binance.com` (REST)
 and `stream.binance.com` (websocket). Some regions, the US among them, are
-blocked by Binance: the servers answer HTTP 451 (or 403). XView then shows a
-region error. Use a VPN or the CSV import in that case.
+blocked by Binance: the servers answer HTTP 451. XView then shows a region
+error. Use a VPN or the CSV import in that case. Other HTTP errors (403
+included) show a load error with Retry.
 
 ### CSV
 

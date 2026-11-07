@@ -6,6 +6,12 @@ pub struct Anchor {
     pub price: f64,
 }
 
+impl Anchor {
+    pub fn is_finite(&self) -> bool {
+        self.price.is_finite()
+    }
+}
+
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct DrawingId(pub u64);
 
@@ -19,9 +25,25 @@ pub enum DrawingKind {
     Rectangle { a: Anchor, b: Anchor },
 }
 
-/// XView's own drawing colors, 0xRRGGBBAA.
+impl DrawingKind {
+    /// Whether every price is finite. JSON has no NaN or infinity (serde_json
+    /// writes them as null), so a non-finite drawing would make the saved
+    /// file unreadable.
+    pub fn is_finite(&self) -> bool {
+        match self {
+            DrawingKind::TrendLine { a, b }
+            | DrawingKind::Ray { a, b }
+            | DrawingKind::Rectangle { a, b } => a.is_finite() && b.is_finite(),
+            DrawingKind::HorizontalLine { price } => price.is_finite(),
+            DrawingKind::VerticalLine { .. } => true,
+        }
+    }
+}
+
+/// XView's own drawing colors, 0xRRGGBBAA. The first (the default) is the
+/// app accent (`AppTheme::light().accent`, `ChartColors::light().selection`).
 pub const PALETTE: [u32; 8] = [
-    0x2962FFFF, 0xE53935FF, 0x43A047FF, 0xFB8C00FF, 0x8E24AAFF, 0x00ACC1FF, 0xD81B60FF, 0x757575FF,
+    0x3B6FE8FF, 0xE53935FF, 0x43A047FF, 0xFB8C00FF, 0x8E24AAFF, 0x00ACC1FF, 0xD81B60FF, 0x757575FF,
 ];
 
 #[derive(Copy, Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -48,6 +70,14 @@ pub struct Drawing {
     pub style: Style,
 }
 
+impl Drawing {
+    /// Whether the drawing can be saved and read back (see
+    /// `DrawingKind::is_finite`; `Style` holds only integers).
+    pub fn is_finite(&self) -> bool {
+        self.kind.is_finite()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -55,6 +85,6 @@ mod tests {
     #[test]
     fn default_style_uses_first_palette_color() {
         let s = Style::default();
-        assert_eq!((s.color, s.width), (0x2962FFFF, 2));
+        assert_eq!((s.color, s.width), (0x3B6FE8FF, 2));
     }
 }

@@ -5,7 +5,7 @@ use std::sync::{Arc, RwLock};
 use futures::FutureExt;
 use futures::future::BoxFuture;
 use futures::stream::BoxStream;
-use xv_core::{Candle, SourceId, Symbol, Timeframe, TzOffset, resample};
+use xv_core::{Candle, SourceId, Symbol, Timeframe, TzOffset, infer_tick_size, resample};
 use xv_data::{CandleUpdate, DataError, DataSource, HistoryPage};
 
 use crate::{infer_timeframe, parse_csv};
@@ -45,9 +45,33 @@ pub struct CsvSource {
     files: Arc<RwLock<HashMap<String, CsvData>>>,
 }
 
-fn decimals(v: f64) -> u32 {
-    let s = format!("{v}");
-    s.split_once('.').map_or(0, |(_, frac)| frac.len() as u32)
+/// Description of a CSV symbol: the folder the file is in, so two files of
+/// the same name tell apart in search and the side card. The home folder is
+/// shown as `~` and deep paths keep their last two folders.
+pub fn csv_description(abs: &Path, home: Option<&Path>) -> String {
+    let Some(dir) = abs.parent() else {
+        return "CSV file".into();
+    };
+    let (prefix, rest) = match home.and_then(|h| dir.strip_prefix(h).ok()) {
+        Some(rest) => ("~", rest),
+        None => ("", dir.strip_prefix("/").unwrap_or(dir)),
+    };
+    let parts: Vec<String> = rest
+        .components()
+        .map(|c| c.as_os_str().to_string_lossy().into_owned())
+        .collect();
+    let shown = if parts.len() > 3 {
+        format!("…/{}", parts[parts.len() - 2..].join("/"))
+    } else {
+        parts.join("/")
+    };
+    let path = match (prefix, shown.is_empty()) {
+        ("~", true) => "~".to_string(),
+        ("~", false) => format!("~/{shown}"),
+        _ if shown.starts_with('…') => shown,
+        _ => format!("/{shown}"),
+    };
+    format!("CSV · {path}")
 }
 
 impl CsvSource {
@@ -67,22 +91,14 @@ impl CsvSource {
         let base_tf = infer_timeframe(&parsed.candles).ok_or(CsvError::UnknownTimeframe)?;
         let abs = path.canonicalize()?;
         let stem = abs.file_stem().map(|s| s.to_string_lossy().to_uppercase()).unwrap_or_default();
-        let dec = parsed
-            .candles
-            .iter()
-            .flat_map(|c| [c.open, c.high, c.low, c.close])
-            .map(decimals)
-            .max()
-            .unwrap_or(0)
-            .min(8);
         let symbol = Symbol {
             source: SourceId(CSV_SOURCE_ID.into()),
             id: abs.to_string_lossy().into_owned(),
             display: stem,
-            description: "CSV file".into(),
+            description: csv_description(&abs, std::env::var_os("HOME").as_deref().map(Path::new)),
             base: String::new(),
             quote: String::new(),
-            tick_size: 10f64.powi(-(dec as i32)),
+            tick_size: infer_tick_size(&parsed.candles),
         };
         let rows = parsed.candles.len();
         let data = CsvData {
@@ -248,6 +264,21 @@ mod tests {
         let other = Symbol { id: "nope".into(), ..sym.clone() };
         assert!(matches!(block_on(src.history(&other, Timeframe::M1, None, 5)), Err(DataError::NotFound(_))));
         assert!(src.subscribe(&sym, Timeframe::M1).is_none());
+    }
+
+    #[test]
+    fn description_names_the_folder() {
+        let home = Some(Path::new("/Users/me"));
+        let d = |p: &str| csv_description(Path::new(p), home);
+        assert_eq!(d("/Users/me/Downloads/btc.csv"), "CSV · ~/Downloads");
+        assert_eq!(d("/Users/me/btc.csv"), "CSV · ~");
+        assert_eq!(d("/Users/me/a/b/c/d/btc.csv"), "CSV · ~/…/c/d");
+        assert_eq!(d("/Users/me/a/b/c/btc.csv"), "CSV · ~/a/b/c");
+        assert_eq!(d("/tmp/x/btc.csv"), "CSV · /tmp/x");
+        assert_eq!(d("/btc.csv"), "CSV · /");
+        assert_eq!(csv_description(Path::new("/Volumes/d/e/f/g/btc.csv"), None), "CSV · …/f/g");
+        // Same file name, different folders: different descriptions.
+        assert_ne!(d("/Users/me/a/btc.csv"), d("/Users/me/b/btc.csv"));
     }
 
     #[test]

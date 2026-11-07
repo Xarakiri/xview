@@ -110,7 +110,9 @@ pub fn parse_ws_kline(msg: &str) -> Result<Candle, DataError> {
 pub fn map_status(status: u16, host: &str) -> Option<DataError> {
     match status {
         200..=299 => None,
-        451 | 403 => Some(DataError::RegionBlocked { host: host.into(), status }),
+        // Only 451 is Binance's region block. A 403 (WAF rule, rate-limit ban, proxy) is an
+        // ordinary HTTP error: it gets the load banner with Retry.
+        451 => Some(DataError::RegionBlocked { host: host.into(), status }),
         _ => Some(DataError::Network(format!("{host}: HTTP {status}"))),
     }
 }
@@ -181,12 +183,12 @@ mod tests {
     }
 
     #[test]
-    fn status_451_is_region_blocked() {
+    fn only_status_451_is_region_blocked() {
         assert_eq!(
             map_status(451, "data-api.binance.vision"),
             Some(DataError::RegionBlocked { host: "data-api.binance.vision".into(), status: 451 })
         );
-        assert!(matches!(map_status(403, "h"), Some(DataError::RegionBlocked { status: 403, .. })));
+        assert_eq!(map_status(403, "h"), Some(DataError::Network("h: HTTP 403".into())));
         assert!(matches!(map_status(500, "h"), Some(DataError::Network(_))));
         assert_eq!(map_status(200, "h"), None);
     }

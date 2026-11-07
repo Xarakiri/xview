@@ -46,16 +46,22 @@ impl DrawingSet {
         }
     }
 
-    pub fn add(&mut self, kind: DrawingKind, style: Style) -> DrawingId {
+    /// Adds a drawing; `None` (and no change) when it has a non-finite price.
+    pub fn add(&mut self, kind: DrawingKind, style: Style) -> Option<DrawingId> {
+        if !kind.is_finite() {
+            return None;
+        }
         self.checkpoint();
         let id = DrawingId(self.next_id);
         self.next_id += 1;
         self.items.push(Drawing { id, kind, style });
-        id
+        Some(id)
     }
 
+    /// Replaces the drawing with `d`'s id. Ignored when there is none or `d`
+    /// has a non-finite price (the drawing keeps its last good shape).
     pub fn replace(&mut self, d: Drawing) {
-        if self.get(d.id).is_none() {
+        if self.get(d.id).is_none() || !d.is_finite() {
             return;
         }
         self.checkpoint();
@@ -129,7 +135,7 @@ mod tests {
     #[test]
     fn undo_redo_gesture() {
         let mut s = DrawingSet::new(vec![]);
-        let id = s.add(k(1.0), Style::default());
+        let id = s.add(k(1.0), Style::default()).unwrap();
         let after_add = s.all().to_vec();
         s.begin_gesture();
         for p in [2.0, 3.0, 4.0] {
@@ -155,7 +161,7 @@ mod tests {
             kind: k(1.0),
             style: Style::default(),
         }]);
-        assert_eq!(s.add(k(2.0), Style::default()), DrawingId(8));
+        assert_eq!(s.add(k(2.0), Style::default()), Some(DrawingId(8)));
         s.remove(DrawingId(7));
         assert!(s.get(DrawingId(7)).is_none());
         s.clear();
@@ -179,5 +185,25 @@ mod tests {
             n += 1;
         }
         assert_eq!(n, 200);
+    }
+
+    #[test]
+    fn non_finite_drawings_are_rejected() {
+        let mut s = DrawingSet::new(vec![]);
+        for p in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            assert_eq!(s.add(k(p), Style::default()), None);
+            let a = Anchor { time_ms: 0, price: 1.0 };
+            let bad = Anchor { time_ms: 10, price: p };
+            assert_eq!(s.add(DrawingKind::TrendLine { a, b: bad }, Style::default()), None);
+            assert_eq!(s.add(DrawingKind::Rectangle { a: bad, b: a }, Style::default()), None);
+        }
+        assert!(s.all().is_empty());
+        assert!(!s.undo(), "a rejected add must not leave an undo step");
+        let id = s.add(k(1.0), Style::default()).unwrap();
+        let mut d = s.get(id).unwrap().clone();
+        d.kind = k(f64::NAN);
+        s.replace(d);
+        assert_eq!(s.get(id).unwrap().kind, k(1.0));
+        assert!(DrawingKind::VerticalLine { time_ms: 5 }.is_finite());
     }
 }

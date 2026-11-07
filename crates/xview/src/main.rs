@@ -26,7 +26,10 @@ use xv_source_binance::BinanceSource;
 use xv_source_csv::CsvSource;
 use xv_store::{data_dir, load_settings};
 
-use workspace::{Boot, OpenCsv, Quit, ToggleTheme, Workspace, rect_of, rect_visible};
+use workspace::{
+    Boot, MIN_WINDOW_HEIGHT, MIN_WINDOW_WIDTH, OpenCsv, Quit, ToggleTheme, Workspace, rect_of,
+    rect_visible,
+};
 
 fn set_menus(cx: &mut App) {
     cx.set_menus([
@@ -63,7 +66,7 @@ fn main() {
                 .filter(|r| rect_visible(r, &displays))
                 .map(|r| Bounds {
                     origin: point(px(r.x), px(r.y)),
-                    size: size(px(r.w), px(r.h)),
+                    size: size(px(r.w.max(MIN_WINDOW_WIDTH)), px(r.h.max(MIN_WINDOW_HEIGHT))),
                 })
                 .unwrap_or_else(|| Bounds::centered(None, size(px(1280.), px(800.)), cx));
             let boot = Boot {
@@ -75,6 +78,7 @@ fn main() {
             cx.open_window(
                 WindowOptions {
                     window_bounds: Some(WindowBounds::Windowed(bounds)),
+                    window_min_size: Some(size(px(MIN_WINDOW_WIDTH), px(MIN_WINDOW_HEIGHT))),
                     titlebar: Some(gpui::TitlebarOptions {
                         title: Some("XView".into()),
                         ..Default::default()

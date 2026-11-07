@@ -9,8 +9,8 @@ mod viewport;
 
 pub use colors::ChartColors;
 pub use frame::{
-    ChartLayout, Frame, FrameInput, Legend, PRICE_AXIS_WIDTH, Prim, RectF, TIME_AXIS_HEIGHT,
-    TextAlign, build_frame,
+    AXIS_LABEL_HEIGHT, ChartLayout, Frame, FrameInput, Legend, PRICE_AXIS_WIDTH, Prim, RectF,
+    TIME_AXIS_HEIGHT, TextAlign, build_frame,
 };
 pub use projector::ChartProjector;
 pub use snap::snap_anchor;

@@ -85,9 +85,18 @@ impl Viewport {
         self.right_index = idx + (self.width - anchor_x) as f64 / self.bar_spacing as f64;
     }
 
+    /// Stretches the price range about its middle by `factor`. The span stays
+    /// finite and positive: it is clamped to 1e-9..1e6 times the price level
+    /// (at least 1e-12 and 1e6 absolute), and a bad factor is ignored.
     pub fn scale_price(&mut self, factor: f32) {
         let c = (self.price.min + self.price.max) / 2.0;
-        let half = (self.price.max - self.price.min) / 2.0 * factor as f64;
+        let half0 = (self.price.max - self.price.min) / 2.0;
+        if !(factor.is_finite() && factor > 0.0 && c.is_finite() && half0.is_finite()) {
+            return;
+        }
+        let min_half = (c.abs() * 1e-9).max(1e-12);
+        let max_half = c.abs().max(1.0) * 1e6;
+        let half = (half0 * factor as f64).clamp(min_half, max_half);
         self.price = PriceRange {
             min: c - half,
             max: c + half,
@@ -241,5 +250,26 @@ mod tests {
         v.auto_scale = true;
         v.scroll_price(40.0);
         assert!(!v.auto_scale);
+    }
+
+    #[test]
+    fn scale_price_keeps_a_finite_positive_span() {
+        let mut v = Viewport::new(800.0, 400.0);
+        v.price = PriceRange { min: 100.0, max: 100.0 };
+        v.scale_price(2.0);
+        assert!(v.price.max > v.price.min, "{:?}", v.price);
+        for _ in 0..200 {
+            v.scale_price(1e30);
+        }
+        assert!(v.price.min.is_finite() && v.price.max.is_finite(), "{:?}", v.price);
+        for _ in 0..400 {
+            v.scale_price(1e-30);
+        }
+        assert!(v.price.max > v.price.min, "{:?}", v.price);
+        let before = v.price;
+        for f in [0.0, -1.0, f32::NAN, f32::INFINITY] {
+            v.scale_price(f);
+        }
+        assert_eq!(v.price, before);
     }
 }

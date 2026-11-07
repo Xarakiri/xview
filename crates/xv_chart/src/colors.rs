@@ -71,4 +71,24 @@ mod tests {
             }
         }
     }
+
+    /// Well-known third-party accents, compared as RGB (any alpha).
+    const BANNED_RGB: [u32; 4] = [0x26A69A, 0xEF5350, 0x131722, 0x2962FF];
+
+    #[test]
+    fn no_chart_or_drawing_color_is_a_banned_accent() {
+        for c in [ChartColors::light(), ChartColors::dark()] {
+            let all = [
+                c.background, c.grid, c.text, c.muted_text, c.up, c.down, c.up_volume,
+                c.down_volume, c.crosshair, c.axis_label_bg, c.axis_label_text, c.last_price_up,
+                c.last_price_down, c.selection,
+            ];
+            for v in all.iter().chain(xv_drawings::PALETTE.iter()) {
+                assert!(!BANNED_RGB.contains(&(v >> 8)), "{v:08X}");
+            }
+        }
+        // The default drawing color is XView's accent.
+        assert_eq!(xv_drawings::PALETTE[0], ChartColors::light().selection);
+        assert_eq!(xv_drawings::Style::default().color, ChartColors::light().selection);
+    }
 }

@@ -682,7 +682,10 @@ impl ChartState {
     }
 
     fn finish_placement(&mut self, kind: DrawingKind, m: Mods, fx: &mut Vec<ChartEffect>) {
-        let id = self.drawings.add(kind, Style::default());
+        // A placement at a non-finite price (degenerate view) is dropped.
+        let Some(id) = self.drawings.add(kind, Style::default()) else {
+            return;
+        };
         fx.push(ChartEffect::DrawingsChanged);
         self.select(Some(id), fx);
         if !m.shift {

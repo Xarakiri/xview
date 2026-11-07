@@ -35,6 +35,9 @@ async fn connect(path: &str) -> Option<Ws> {
 /// connection is dead (sleep/wake, Wi-Fi switch) even though no FIN/RST arrived.
 pub const READ_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// How long to wait for the close handshake of a connection being dropped.
+pub const CLOSE_TIMEOUT: Duration = Duration::from_secs(2);
+
 type ReadResult = Result<Option<Result<Message, WsError>>, Elapsed>;
 
 #[derive(Debug, PartialEq)]
@@ -94,7 +97,8 @@ async fn run(path: String, tx: mpsc::Sender<CandleUpdate>) {
                     ReadOutcome::Disconnect => break,
                 }
             }
-            let _ = ws.close(None).await;
+            // A dead peer never answers the close handshake: don't hang on it.
+            let _ = tokio::time::timeout(CLOSE_TIMEOUT, ws.close(None)).await;
         }
         if !announced_down {
             announced_down = true;

@@ -35,7 +35,7 @@ const TITLE_FONT_SIZE: f32 = 14.0;
 /// Line box used to vertically center axis text on its anchor.
 const TEXT_LINE_HEIGHT: f32 = 16.0;
 /// Background quad behind labelled axis text.
-const LABEL_HEIGHT: f32 = 18.0;
+const LABEL_HEIGHT: f32 = xv_chart::AXIS_LABEL_HEIGHT;
 const LABEL_PAD_X: f32 = 4.0;
 const LABEL_RADIUS: f32 = 3.0;
 const HANDLE_RADIUS: f32 = 4.5;

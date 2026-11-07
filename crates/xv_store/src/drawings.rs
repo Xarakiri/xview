@@ -78,7 +78,17 @@ fn aside(path: &Path) -> LoadedDrawings {
     }
 }
 
+/// Writes `ds` atomically. Refuses (`InvalidInput`, nothing written) a
+/// drawing with a non-finite price: JSON would store it as null and the file
+/// would no longer load. Refuses (`InvalidData`) to replace an existing file
+/// that doesn't parse.
 pub fn save_drawings(dir: &Path, key: &SymbolKey, ds: &[Drawing]) -> std::io::Result<()> {
+    if let Some(d) = ds.iter().find(|d| !d.is_finite()) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("drawing {} has a non-finite price", d.id.0),
+        ));
+    }
     let file = DrawingsFile {
         version: FILE_VERSION,
         symbol: format!("{}:{}", key.source.0, key.id),
@@ -202,6 +212,23 @@ mod tests {
         let err = save_drawings(t.path(), &k, &[drawing(1)]).unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
         assert_eq!(std::fs::read_to_string(&p).unwrap(), "{garbage");
+    }
+
+    #[test]
+    fn save_refuses_non_finite_drawings_and_keeps_the_old_file() {
+        let t = tempfile::TempDir::new().unwrap();
+        let k = key("x");
+        save_drawings(t.path(), &k, &[drawing(1)]).unwrap();
+        let p = drawings_path(t.path(), &k);
+        let before = std::fs::read_to_string(&p).unwrap();
+        for price in [f64::NAN, f64::INFINITY] {
+            let mut bad = drawing(2);
+            bad.kind = DrawingKind::HorizontalLine { price };
+            let err = save_drawings(t.path(), &k, &[drawing(1), bad]).unwrap_err();
+            assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+            assert_eq!(std::fs::read_to_string(&p).unwrap(), before);
+        }
+        assert!(matches!(load_drawings(t.path(), &k), LoadedDrawings::Ok(v) if v == [drawing(1)]));
     }
 
     #[cfg(unix)]
