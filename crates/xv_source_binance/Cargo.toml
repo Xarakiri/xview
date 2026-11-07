@@ -6,3 +6,10 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+xv_core = { path = "../xv_core" }
+xv_data = { path = "../xv_data" }
+futures = { workspace = true }
+tokio = { workspace = true, features = ["net"] }
+serde_json = { workspace = true }
+reqwest = { workspace = true }
+tokio-tungstenite = { workspace = true }
