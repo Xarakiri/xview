@@ -10,8 +10,6 @@ pub fn u32_to_hsla(c: u32) -> Hsla {
     rgba(c).into()
 }
 
-// The chrome colors are consumed by the app shell (Task 14).
-#[allow(dead_code)]
 #[derive(Clone, Debug)]
 pub struct AppTheme {
     pub mode: ThemeMode,
@@ -23,11 +21,12 @@ pub struct AppTheme {
     pub muted: Hsla,
     pub hover: Hsla,
     pub active_bg: Hsla,
+    /// Links and focus rings; no shell control uses it yet.
+    #[allow(dead_code)]
     pub accent: Hsla,
     pub badge: Hsla,
 }
 
-#[allow(dead_code)]
 impl AppTheme {
     pub fn light() -> Self {
         AppTheme {
