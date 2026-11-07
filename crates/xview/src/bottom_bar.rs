@@ -5,9 +5,10 @@
 use std::time::Duration;
 
 use chrono::{Datelike, TimeZone, Utc};
-use gpui::{Context, IntoElement, Render, SharedString, Task, Window, div, prelude::*, px};
+use gpui::{Context, Entity, IntoElement, Render, SharedString, Task, Window, div, prelude::*, px};
 use xv_core::TzOffset;
 
+use crate::chart_view::ChartView;
 use crate::theme::AppTheme;
 use crate::widgets::{icon_button, tooltip, vsep};
 use crate::workspace::{BOTTOM_BAR_HEIGHT, ShowSpan, ToggleClockUtc, tz_for};
@@ -33,21 +34,22 @@ pub const RANGES: [(&str, Range); 9] = [
     ("All", Range::All),
 ];
 
-/// The span for `ShowSpan`. YTD runs from Jan 1 00:00 in `tz` of the
-/// current year up to `now_ms`.
-pub fn span_ms(r: Range, now_ms: i64, tz: TzOffset) -> Option<i64> {
+/// The span for `ShowSpan`, which measures back from the last candle.
+/// `end_ms` is the last candle's open time (now when there is no data); YTD
+/// runs from Jan 1 00:00 in `tz` of `end_ms`'s year up to `end_ms`.
+pub fn span_ms(r: Range, end_ms: i64, tz: TzOffset) -> Option<i64> {
     match r {
         Range::Days(d) => Some(d * DAY_MS),
         Range::All => None,
         Range::YearToDate => {
             let off = tz.seconds as i64 * 1000;
-            let local = Utc.timestamp_millis_opt(now_ms + off).single()?;
+            let local = Utc.timestamp_millis_opt(end_ms + off).single()?;
             let jan1 = Utc
                 .with_ymd_and_hms(local.year(), 1, 1, 0, 0, 0)
                 .single()?
                 .timestamp_millis()
                 - off;
-            Some((now_ms - jan1).max(DAY_MS))
+            Some((end_ms - jan1).max(DAY_MS))
         }
     }
 }
@@ -72,13 +74,21 @@ pub fn format_clock(now_ms: i64, tz: TzOffset) -> String {
 }
 
 pub struct BottomBar {
+    /// Read on a range click only (for the last candle's time); the bar does
+    /// not observe the chart.
+    chart: Entity<ChartView>,
     theme: AppTheme,
     use_utc: bool,
     _tick: Task<()>,
 }
 
 impl BottomBar {
-    pub fn new(theme: AppTheme, use_utc: bool, cx: &mut Context<Self>) -> Self {
+    pub fn new(
+        chart: Entity<ChartView>,
+        theme: AppTheme,
+        use_utc: bool,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let tick = cx.spawn(async move |this, cx| {
             loop {
                 // Wake just after the next whole second.
@@ -92,6 +102,7 @@ impl BottomBar {
             }
         });
         BottomBar {
+            chart,
             theme,
             use_utc,
             _tick: tick,
@@ -110,7 +121,7 @@ impl BottomBar {
 }
 
 impl Render for BottomBar {
-    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let t = &self.theme;
         let hover = t.hover;
         let tz = tz_for(self.use_utc);
@@ -138,11 +149,18 @@ impl Render for BottomBar {
                     .rounded(px(4.))
                     .hover(move |s| s.bg(hover))
                     .child(label)
-                    .on_click(move |_, window, cx| {
-                        let span =
-                            span_ms(range, Utc::now().timestamp_millis(), TzOffset::local_now());
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        let end_ms = this
+                            .chart
+                            .read(cx)
+                            .state
+                            .series
+                            .last()
+                            .map(|c| c.open_time_ms)
+                            .unwrap_or_else(|| Utc::now().timestamp_millis());
+                        let span = span_ms(range, end_ms, TzOffset::local_now());
                         window.dispatch_action(Box::new(ShowSpan(span)), cx)
-                    })
+                    }))
             }))
             .child(vsep(18., t))
             .child(
@@ -221,6 +239,20 @@ mod tests {
         assert_eq!(
             span_ms(Range::YearToDate, NOW, tz),
             Some(NOW - (jan1 - 3_600_000))
+        );
+        // Measured from the last candle, not now: data ending 2025-12-31 12:00
+        // gives YTD from 2025-01-01.
+        let end = Utc
+            .with_ymd_and_hms(2025, 12, 31, 12, 0, 0)
+            .unwrap()
+            .timestamp_millis();
+        let jan1_2025 = Utc
+            .with_ymd_and_hms(2025, 1, 1, 0, 0, 0)
+            .unwrap()
+            .timestamp_millis();
+        assert_eq!(
+            span_ms(Range::YearToDate, end, TzOffset::UTC),
+            Some(end - jan1_2025)
         );
     }
 }

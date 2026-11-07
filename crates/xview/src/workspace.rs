@@ -7,7 +7,7 @@
 //! notifies itself only when what it shows changes.
 
 use gpui::{
-    Action, App, Context, Entity, FocusHandle, Focusable, KeyBinding, PromptLevel, StyleRefinement,
+    Action, App, Context, Entity, Focusable, KeyBinding, PromptLevel, StyleRefinement,
     Subscription, Window, actions, div, prelude::*, px,
 };
 use xv_chart::ChartEffect;
@@ -75,7 +75,6 @@ pub struct Workspace {
     timeframe: Timeframe,
     /// Clock and chart times in UTC instead of the local offset.
     use_utc: bool,
-    focus: FocusHandle,
     top_bar: Entity<TopBar>,
     left_toolbar: Entity<LeftToolbar>,
     style_bar: Entity<StyleBar>,
@@ -117,7 +116,7 @@ impl Workspace {
         let left_toolbar = cx.new(|cx| LeftToolbar::new(chart.clone(), theme.clone(), cx));
         let style_bar = cx.new(|_| StyleBar::new(chart.clone(), theme.clone()));
         let side_panel = cx.new(|cx| SidePanel::new(chart.clone(), theme.clone(), cx));
-        let bottom_bar = cx.new(|cx| BottomBar::new(theme.clone(), use_utc, cx));
+        let bottom_bar = cx.new(|cx| BottomBar::new(chart.clone(), theme.clone(), use_utc, cx));
 
         Workspace {
             chart,
@@ -125,7 +124,6 @@ impl Workspace {
             symbol,
             timeframe,
             use_utc,
-            focus: cx.focus_handle(),
             top_bar,
             left_toolbar,
             style_bar,
@@ -254,8 +252,10 @@ fn demo_series(tf: Timeframe, tz: TzOffset) -> Series {
 
 impl Render for Workspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        // Keep keyboard focus inside the workspace so actions dispatched from
-        // the toolbars reach the handlers below.
+        // The chart owns keyboard focus: its key bindings (Delete, Esc, undo)
+        // need it, and actions dispatched from the toolbars bubble from it to
+        // the handlers below. No shell element tracks focus, so shell clicks
+        // never take it; this only restores it if nothing is focused.
         if window.focused(cx).is_none() {
             window.focus(&self.chart.focus_handle(cx), cx);
         }
@@ -286,7 +286,6 @@ impl Render for Workspace {
             );
         div()
             .key_context("Workspace")
-            .track_focus(&self.focus)
             .on_action(
                 cx.listener(|this, a: &SelectTimeframe, _, cx| this.select_timeframe(a.0, cx)),
             )

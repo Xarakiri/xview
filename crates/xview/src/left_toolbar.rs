@@ -226,15 +226,19 @@ impl Render for LeftToolbar {
         let s = self.snap;
         let cursor_active = s.tool == Tool::Cursor;
         div()
+            // Scrolls vertically so every tool stays reachable in short windows.
+            .id("left-toolbar")
             .flex()
             .flex_col()
             .flex_none()
             .items_center()
             .gap(px(GAP))
             .pt(px(8.))
+            .pb(px(8.))
             .w(px(LEFT_TOOLBAR_WIDTH))
             .h_full()
-            .overflow_hidden()
+            .overflow_x_hidden()
+            .overflow_y_scroll()
             .border_r(px(REGION_BORDER))
             .border_color(t.panel_bg)
             .bg(t.bg)

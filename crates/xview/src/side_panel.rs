@@ -16,7 +16,7 @@ use crate::workspace::{RAIL_WIDTH, REGION_BORDER, SIDE_PANEL_WIDTH};
 const RAIL_ICONS: [&str; 6] = ["list", "bell", "chat", "bulb", "calendar", "help"];
 
 /// What the details card shows.
-#[derive(Clone, PartialEq)]
+#[derive(Clone)]
 struct Details {
     symbol: SharedString,
     description: SharedString,
@@ -25,18 +25,32 @@ struct Details {
     tick_size: f64,
 }
 
+fn last_change(chart: &ChartView) -> Option<(f64, f64)> {
+    let cs = chart.state.series.candles();
+    cs.last().map(|c| {
+        let prev = if cs.len() >= 2 {
+            cs[cs.len() - 2].close
+        } else {
+            c.open
+        };
+        (c.close, c.close - prev)
+    })
+}
+
 impl Details {
+    /// True when `chart` would show the same details. Compares borrowed
+    /// fields, so the per-mouse-move check allocates nothing.
+    fn matches(&self, chart: &ChartView) -> bool {
+        let s = &chart.state.series;
+        self.last == last_change(chart)
+            && self.tick_size == s.symbol.tick_size
+            && self.symbol.as_ref() == s.symbol.display
+            && self.description.as_ref() == s.symbol.description
+    }
+
     fn of(chart: &ChartView) -> Self {
         let s = &chart.state.series;
-        let cs = s.candles();
-        let last = cs.last().map(|c| {
-            let prev = if cs.len() >= 2 {
-                cs[cs.len() - 2].close
-            } else {
-                c.open
-            };
-            (c.close, c.close - prev)
-        });
+        let last = last_change(chart);
         Details {
             symbol: s.symbol.display.clone().into(),
             description: s.symbol.description.clone().into(),
@@ -56,9 +70,9 @@ impl SidePanel {
     pub fn new(chart: Entity<ChartView>, theme: AppTheme, cx: &mut Context<Self>) -> Self {
         let details = Details::of(chart.read(cx));
         let observe = cx.observe(&chart, |this, chart, cx| {
-            let d = Details::of(chart.read(cx));
-            if d != this.details {
-                this.details = d;
+            let chart = chart.read(cx);
+            if !this.details.matches(chart) {
+                this.details = Details::of(chart);
                 cx.notify();
             }
         });
