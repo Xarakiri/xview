@@ -22,6 +22,16 @@ pub enum CsvError {
     UnknownTimeframe,
 }
 
+/// Result of loading a file: the symbol plus what was dropped on the way.
+#[derive(Clone, Debug, PartialEq)]
+pub struct CsvLoadReport {
+    pub symbol: Symbol,
+    /// Number of candles loaded.
+    pub rows: usize,
+    /// (1-based line, reason) for rejected rows.
+    pub skipped: Vec<(usize, String)>,
+}
+
 struct CsvData {
     symbol: Symbol,
     base_tf: Timeframe,
@@ -47,6 +57,11 @@ impl CsvSource {
 
     /// Loads (or reloads) a file and returns its symbol. The symbol id is the canonical path.
     pub fn load_file(&self, path: &Path) -> Result<Symbol, CsvError> {
+        self.load_file_report(path).map(|r| r.symbol)
+    }
+
+    /// Like `load_file`, but also reports the row count and skipped lines.
+    pub fn load_file_report(&self, path: &Path) -> Result<CsvLoadReport, CsvError> {
         let text = std::fs::read_to_string(path)?;
         let parsed = parse_csv(&text)?;
         let base_tf = infer_timeframe(&parsed.candles).ok_or(CsvError::UnknownTimeframe)?;
@@ -69,14 +84,15 @@ impl CsvSource {
             quote: String::new(),
             tick_size: 10f64.powi(-(dec as i32)),
         };
+        let rows = parsed.candles.len();
         let data = CsvData {
             symbol: symbol.clone(),
             base_tf,
-            base: Arc::new(parsed.candles),
+            base: Arc::new(parsed.candles.clone()),
             cache: HashMap::new(),
         };
         self.files.write().unwrap_or_else(|e| e.into_inner()).insert(symbol.id.clone(), data);
-        Ok(symbol)
+        Ok(CsvLoadReport { symbol, rows, skipped: parsed.skipped })
     }
 }
 
@@ -182,6 +198,44 @@ mod tests {
         let older = block_on(src.history(&sym, Timeframe::M5, Some(first), 1000)).unwrap();
         assert!(older.candles.iter().all(|c| c.open_time_ms < first));
         assert!(!older.has_more);
+    }
+
+    #[test]
+    fn out_of_range_time_is_skipped() {
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        for i in 0..5 {
+            writeln!(f, "{},1,2,0.5,1.5,1", 1762524000 + 3600 * i).unwrap();
+        }
+        writeln!(f, "1762526400000000000,1,2,0.5,1.5,1").unwrap();
+        f.flush().unwrap();
+        let src = CsvSource::new();
+        let r = src.load_file_report(f.path()).unwrap();
+        assert_eq!(r.rows, 5);
+        assert_eq!(r.skipped.iter().map(|s| s.0).collect::<Vec<_>>(), vec![6]);
+        let sym = r.symbol;
+        for tf in [Timeframe::Mo1, Timeframe::W1] {
+            assert!(block_on(src.history(&sym, tf, None, 100)).is_ok());
+        }
+    }
+
+    #[test]
+    fn load_report_lists_skipped_lines() {
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        writeln!(f, "time,open,high,low,close,volume").unwrap();
+        writeln!(f, "1762524000,1,2,0.5,1.5,1").unwrap();
+        writeln!(f, "1762527600,1,2,0.5,1.5,1").unwrap();
+        writeln!(f, "1762531200,1,2,0.5,1.5,1").unwrap();
+        writeln!(f, "1762532000,1,2,0.5,1.5,1").unwrap();
+        writeln!(f, "1762534800,1,2,0.5,NaN,1").unwrap();
+        writeln!(f, "1762538400,1,2,0.5,1.5,1").unwrap();
+        writeln!(f, "1762542000,1,2").unwrap();
+        writeln!(f, "1762545600,1,2,0.5,1.5,1").unwrap();
+        f.flush().unwrap();
+        let src = CsvSource::new();
+        let r = src.load_file_report(f.path()).unwrap();
+        assert_eq!(r.rows, 6);
+        assert_eq!(r.skipped.iter().map(|s| s.0).collect::<Vec<_>>(), vec![6, 8]);
+        assert_eq!(src.load_file(f.path()).unwrap(), r.symbol);
     }
 
     #[test]

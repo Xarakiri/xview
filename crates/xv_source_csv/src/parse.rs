@@ -20,8 +20,19 @@ pub fn parse_time(s: &str) -> Option<i64> {
     if s.is_empty() {
         return None;
     }
+    in_range(parse_time_unchecked(s)?)
+}
+
+/// Keeps timestamps well inside chrono's range and clear of i64 overflow.
+const MAX_ABS_MS: u64 = 8_000_000_000_000_000;
+
+fn in_range(ms: i64) -> Option<i64> {
+    (ms.unsigned_abs() <= MAX_ABS_MS).then_some(ms)
+}
+
+fn parse_time_unchecked(s: &str) -> Option<i64> {
     if let Ok(n) = s.parse::<i64>() {
-        return Some(if n.abs() < 100_000_000_000 { n.checked_mul(1000)? } else { n });
+        return if n.unsigned_abs() < 100_000_000_000 { n.checked_mul(1000) } else { Some(n) };
     }
     if let Ok(dt) = DateTime::parse_from_rfc3339(s) {
         return Some(dt.timestamp_millis());
@@ -96,7 +107,7 @@ pub fn infer_timeframe(candles: &[Candle]) -> Option<Timeframe> {
     }
     let mut counts: HashMap<Timeframe, usize> = HashMap::new();
     for w in candles.windows(2) {
-        let gap = w[1].open_time_ms - w[0].open_time_ms;
+        let gap = w[1].open_time_ms.saturating_sub(w[0].open_time_ms);
         if gap <= 0 {
             continue;
         }
@@ -106,7 +117,7 @@ pub fn infer_timeframe(candles: &[Candle]) -> Option<Timeframe> {
             Timeframe::ALL
                 .iter()
                 .copied()
-                .map(|tf| (tf, (gap - tf.nominal_ms()).abs() as f64 / tf.nominal_ms() as f64))
+                .map(|tf| (tf, (gap - tf.nominal_ms()).unsigned_abs() as f64 / tf.nominal_ms() as f64))
                 .filter(|(_, err)| *err <= 0.10)
                 .min_by(|a, b| a.1.total_cmp(&b.1))
                 .map(|(tf, _)| tf)
@@ -134,6 +145,19 @@ mod tests {
         assert_eq!(parse_time("2025-11-07"), Some(1762473600000));
         assert_eq!(parse_time("abc"), None);
         assert_eq!(parse_time(""), None);
+    }
+
+    #[test]
+    fn min_i64_time_does_not_panic() {
+        assert_eq!(parse_time("-9223372036854775808"), None);
+        assert_eq!(parse_time("9223372036854775807"), None);
+        assert_eq!(parse_time("1762526400000000000"), None);
+    }
+
+    #[test]
+    fn infer_extreme_times_do_not_overflow() {
+        let cs = [bar(i64::MIN), bar(i64::MAX)];
+        let _ = infer_timeframe(&cs);
     }
 
     #[test]
