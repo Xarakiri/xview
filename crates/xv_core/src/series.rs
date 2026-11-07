@@ -59,7 +59,7 @@ impl Series {
         }
         let added = older.len();
         if added > 0 {
-            older.extend(self.candles.drain(..));
+            older.append(&mut self.candles);
             self.candles = older;
         }
         added
