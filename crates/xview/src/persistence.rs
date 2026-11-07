@@ -147,7 +147,11 @@ impl Persistence {
         for (key, generation, r) in results {
             match r {
                 Ok(()) => {
-                    if self.unsaved.get(&key).is_some_and(|(g, _)| *g == generation) {
+                    if self
+                        .unsaved
+                        .get(&key)
+                        .is_some_and(|(g, _)| *g == generation)
+                    {
                         self.unsaved.remove(&key);
                     }
                 }
@@ -204,6 +208,9 @@ mod tests {
     fn hline(id: u64, price: f64) -> Drawing {
         Drawing {
             id: DrawingId(id),
+            name: None,
+            locked: false,
+            hidden: false,
             kind: DrawingKind::HorizontalLine { price },
             style: Style::default(),
         }

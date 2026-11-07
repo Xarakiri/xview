@@ -91,7 +91,7 @@ impl Render for StyleBar {
         let selected = st.selected_screen_bounds().zip(
             st.selected
                 .and_then(|id| st.drawings.get(id))
-                .map(|d| d.style),
+                .map(|d| d.style.clone()),
         );
         let Some((bounds, style)) = selected else {
             return div().into_any_element();
@@ -104,6 +104,7 @@ impl Render for StyleBar {
 
         let swatches = PALETTE.iter().enumerate().map(|(i, &c)| {
             let active = style.color == c;
+            let style = style.clone();
             div()
                 .id(SharedString::from(format!("swatch-{i}")))
                 .flex_none()
@@ -113,11 +114,18 @@ impl Render for StyleBar {
                 .border_2()
                 .border_color(if active { t.text } else { u32_to_hsla(c) })
                 .on_click(cx.listener(move |this, _, _, cx| {
-                    this.set_style(Style { color: c, ..style }, cx)
+                    this.set_style(
+                        Style {
+                            color: c,
+                            ..style.clone()
+                        },
+                        cx,
+                    )
                 }))
         });
         let widths = WIDTHS.iter().map(|&w| {
             let active = style.width == w;
+            let style = style.clone();
             div()
                 .id(SharedString::from(format!("width-{w}")))
                 .flex()
@@ -131,7 +139,13 @@ impl Render for StyleBar {
                 .tooltip(tooltip(format!("{w} px"), &t))
                 .child(div().w(px(14.)).h(px(w as f32)).bg(t.text))
                 .on_click(cx.listener(move |this, _, _, cx| {
-                    this.set_style(Style { width: w, ..style }, cx)
+                    this.set_style(
+                        Style {
+                            width: w,
+                            ..style.clone()
+                        },
+                        cx,
+                    )
                 }))
         });
         let chart = self.chart.clone();

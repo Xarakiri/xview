@@ -115,6 +115,9 @@ mod tests {
     fn drawing(n: u64) -> Drawing {
         Drawing {
             id: DrawingId(n),
+            name: None,
+            locked: false,
+            hidden: false,
             kind: DrawingKind::Ray {
                 a: Anchor {
                     time_ms: 10,

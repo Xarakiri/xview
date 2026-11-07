@@ -54,7 +54,7 @@ impl DrawingSet {
         self.checkpoint();
         let id = DrawingId(self.next_id);
         self.next_id += 1;
-        self.items.push(Drawing { id, kind, style });
+        self.items.push(Drawing::new(id, kind, style));
         Some(id)
     }
 
@@ -67,6 +67,80 @@ impl DrawingSet {
         self.checkpoint();
         if let Some(slot) = self.items.iter_mut().find(|x| x.id == d.id) {
             *slot = d;
+        }
+    }
+
+    /// Applies `f` to a copy of the drawing as one undo step. False (and no
+    /// change) when the id is unknown or the result is non-finite.
+    pub fn update(&mut self, id: DrawingId, f: impl FnOnce(&mut Drawing)) -> bool {
+        let Some(mut d) = self.get(id).cloned() else {
+            return false;
+        };
+        f(&mut d);
+        if !d.is_finite() {
+            return false;
+        }
+        self.checkpoint();
+        if let Some(slot) = self.items.iter_mut().find(|x| x.id == id) {
+            *slot = d;
+        }
+        true
+    }
+
+    /// Moves the drawing to the top of the z-order (end of `all()`).
+    pub fn bring_to_front(&mut self, id: DrawingId) {
+        let Some(i) = self.items.iter().position(|d| d.id == id) else {
+            return;
+        };
+        if i + 1 == self.items.len() {
+            return;
+        }
+        self.checkpoint();
+        let d = self.items.remove(i);
+        self.items.push(d);
+    }
+
+    /// Moves the drawing to the bottom of the z-order (start of `all()`).
+    pub fn send_to_back(&mut self, id: DrawingId) {
+        let Some(i) = self.items.iter().position(|d| d.id == id) else {
+            return;
+        };
+        if i == 0 {
+            return;
+        }
+        self.checkpoint();
+        let d = self.items.remove(i);
+        self.items.insert(0, d);
+    }
+
+    /// Adds a copy of `d` under a fresh id, on top. `None` when non-finite.
+    pub fn insert_copy(&mut self, d: &Drawing) -> Option<DrawingId> {
+        if !d.is_finite() {
+            return None;
+        }
+        self.checkpoint();
+        let id = DrawingId(self.next_id);
+        self.next_id += 1;
+        let mut c = d.clone();
+        c.id = id;
+        self.items.push(c);
+        Some(id)
+    }
+
+    pub fn snapshot(&self, id: DrawingId) -> Option<Drawing> {
+        self.get(id).cloned()
+    }
+
+    /// Puts `d` back (replace by id, or insert when missing) without touching
+    /// undo/redo; for the dialog's live preview and Cancel.
+    pub fn restore_without_undo(&mut self, d: Drawing) {
+        if !d.is_finite() {
+            return;
+        }
+        self.next_id = self.next_id.max(d.id.0 + 1);
+        match self.items.iter_mut().find(|x| x.id == d.id) {
+            Some(slot) => *slot = d,
+            None => self.items.push(d),
         }
     }
 
@@ -156,11 +230,7 @@ mod tests {
 
     #[test]
     fn ids_continue_after_max_and_remove_clear_undo() {
-        let mut s = DrawingSet::new(vec![Drawing {
-            id: DrawingId(7),
-            kind: k(1.0),
-            style: Style::default(),
-        }]);
+        let mut s = DrawingSet::new(vec![Drawing::new(DrawingId(7), k(1.0), Style::default())]);
         assert_eq!(s.add(k(2.0), Style::default()), Some(DrawingId(8)));
         s.remove(DrawingId(7));
         assert!(s.get(DrawingId(7)).is_none());
@@ -192,10 +262,22 @@ mod tests {
         let mut s = DrawingSet::new(vec![]);
         for p in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
             assert_eq!(s.add(k(p), Style::default()), None);
-            let a = Anchor { time_ms: 0, price: 1.0 };
-            let bad = Anchor { time_ms: 10, price: p };
-            assert_eq!(s.add(DrawingKind::TrendLine { a, b: bad }, Style::default()), None);
-            assert_eq!(s.add(DrawingKind::Rectangle { a: bad, b: a }, Style::default()), None);
+            let a = Anchor {
+                time_ms: 0,
+                price: 1.0,
+            };
+            let bad = Anchor {
+                time_ms: 10,
+                price: p,
+            };
+            assert_eq!(
+                s.add(DrawingKind::TrendLine { a, b: bad }, Style::default()),
+                None
+            );
+            assert_eq!(
+                s.add(DrawingKind::Rectangle { a: bad, b: a }, Style::default()),
+                None
+            );
         }
         assert!(s.all().is_empty());
         assert!(!s.undo(), "a rejected add must not leave an undo step");
@@ -205,5 +287,100 @@ mod tests {
         s.replace(d);
         assert_eq!(s.get(id).unwrap().kind, k(1.0));
         assert!(DrawingKind::VerticalLine { time_ms: 5 }.is_finite());
+    }
+
+    fn three() -> (DrawingSet, [DrawingId; 3]) {
+        let mut s = DrawingSet::new(vec![]);
+        let ids = [1.0, 2.0, 3.0].map(|p| s.add(k(p), Style::default()).unwrap());
+        (s, ids)
+    }
+
+    fn order(s: &DrawingSet) -> Vec<DrawingId> {
+        s.all().iter().map(|d| d.id).collect()
+    }
+
+    #[test]
+    fn update_is_one_undo_step() {
+        let (mut s, [a, ..]) = three();
+        let before = s.get(a).unwrap().clone();
+        assert!(s.update(a, |d| {
+            d.style.color = 0x112233FF;
+            d.style.width = 4;
+        }));
+        let d = s.get(a).unwrap();
+        assert_eq!((d.style.color, d.style.width), (0x112233FF, 4));
+        assert!(s.undo());
+        assert_eq!(s.get(a).unwrap(), &before);
+        assert!(!s.update(DrawingId(99), |_| {}));
+    }
+
+    #[test]
+    fn update_rejects_non_finite() {
+        let (mut s, [a, ..]) = three();
+        let before = s.all().to_vec();
+        assert!(!s.update(a, |d| d.kind = k(f64::NAN)));
+        assert_eq!(s.all(), &before[..]);
+        // Only the three adds are on the undo stack.
+        let mut n = 0;
+        while s.undo() {
+            n += 1;
+        }
+        assert_eq!(n, 3);
+    }
+
+    #[test]
+    fn z_order_ops() {
+        let (mut s, [a, b, c]) = three();
+        s.bring_to_front(a);
+        assert_eq!(order(&s), vec![b, c, a]);
+        assert!(s.undo());
+        assert_eq!(order(&s), vec![a, b, c]);
+        s.send_to_back(c);
+        assert_eq!(order(&s), vec![c, a, b]);
+        assert!(s.undo());
+        assert_eq!(order(&s), vec![a, b, c]);
+        // No-ops leave no undo step.
+        s.bring_to_front(c);
+        s.send_to_back(a);
+        assert!(s.undo());
+        assert_eq!(order(&s), vec![a, b]);
+    }
+
+    #[test]
+    fn insert_copy_new_id() {
+        let (mut s, [a, ..]) = three();
+        let src = s.get(a).unwrap().clone();
+        let id = s.insert_copy(&src).unwrap();
+        assert_eq!(id, DrawingId(4));
+        let c = s.get(id).unwrap();
+        assert_eq!((&c.kind, &c.style), (&src.kind, &src.style));
+        assert_eq!(s.add(k(9.0), Style::default()), Some(DrawingId(5)));
+        assert!(s.undo() && s.undo());
+        assert_eq!(s.all().len(), 3);
+        assert_eq!(
+            s.insert_copy(&Drawing::new(DrawingId(1), k(f64::NAN), Style::default())),
+            None
+        );
+    }
+
+    #[test]
+    fn restore_without_undo_leaves_history() {
+        let (mut s, [a, ..]) = three();
+        let snap = s.snapshot(a).unwrap();
+        assert!(s.update(a, |d| d.style.width = 4));
+        let (undo_len, redo_len) = (s.undo.len(), s.redo.len());
+        s.restore_without_undo(snap.clone());
+        assert_eq!(s.get(a).unwrap(), &snap);
+        s.remove(a);
+        s.undo();
+        s.restore_without_undo(snap.clone());
+        // missing id is inserted
+        s.items.retain(|d| d.id != a);
+        let (u, r) = (s.undo.len(), s.redo.len());
+        s.restore_without_undo(snap.clone());
+        assert_eq!((s.undo.len(), s.redo.len()), (u, r));
+        assert_eq!(s.get(a).unwrap(), &snap);
+        assert!(undo_len >= 4 && redo_len == 0);
+        assert!(s.snapshot(DrawingId(99)).is_none());
     }
 }

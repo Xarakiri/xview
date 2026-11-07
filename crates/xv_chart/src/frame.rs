@@ -726,6 +726,9 @@ mod tests {
         let drawings = vec![
             Drawing {
                 id: DrawingId(1),
+                name: None,
+                locked: false,
+                hidden: false,
                 style: Style::default(),
                 kind: DrawingKind::TrendLine {
                     a: Anchor {
@@ -740,6 +743,9 @@ mod tests {
             },
             Drawing {
                 id: DrawingId(2),
+                name: None,
+                locked: false,
+                hidden: false,
                 style: Style::default(),
                 kind: DrawingKind::Ray {
                     a: Anchor {
@@ -754,16 +760,25 @@ mod tests {
             },
             Drawing {
                 id: DrawingId(3),
+                name: None,
+                locked: false,
+                hidden: false,
                 style: Style::default(),
                 kind: DrawingKind::HorizontalLine { price: 5.0 },
             },
             Drawing {
                 id: DrawingId(4),
+                name: None,
+                locked: false,
+                hidden: false,
                 style: Style::default(),
                 kind: DrawingKind::VerticalLine { time_ms: T0 + H },
             },
             Drawing {
                 id: DrawingId(5),
+                name: None,
+                locked: false,
+                hidden: false,
                 style: Style::default(),
                 kind: DrawingKind::Rectangle {
                     a: Anchor {
@@ -815,9 +830,13 @@ mod tests {
         fit(&mut vp, &s);
         let d = [Drawing {
             id: DrawingId(1),
+            name: None,
+            locked: false,
+            hidden: false,
             style: Style {
                 color: 0x112233FF,
                 width: 3,
+                ..Style::default()
             },
             kind: DrawingKind::Ray {
                 a: Anchor {
@@ -855,17 +874,25 @@ mod tests {
         let d = [
             Drawing {
                 id: DrawingId(1),
+                name: None,
+                locked: false,
+                hidden: false,
                 style: Style {
                     color: 0xAABBCCFF,
                     width: 1,
+                    ..Style::default()
                 },
                 kind: DrawingKind::HorizontalLine { price: 100.0 },
             },
             Drawing {
                 id: DrawingId(2),
+                name: None,
+                locked: false,
+                hidden: false,
                 style: Style {
                     color: 0x112233FF,
                     width: 1,
+                    ..Style::default()
                 },
                 kind: DrawingKind::Rectangle {
                     a: Anchor {
@@ -936,7 +963,10 @@ mod tests {
         let layout = ChartLayout::new(1000.0, 600.0);
         let mut vp = Viewport::new(layout.plot.w, layout.plot.h);
         fit(&mut vp, &s);
-        vp.price = PriceRange { min: 50.0, max: 150.0 };
+        vp.price = PriceRange {
+            min: 50.0,
+            max: 150.0,
+        };
         vp.auto_scale = false;
         let plain = |f: &Frame| -> Vec<String> {
             f.price_axis
@@ -951,7 +981,9 @@ mod tests {
             f.price_axis
                 .iter()
                 .filter_map(|p| match p {
-                    Prim::Text { text, bg: Some(_), .. } => Some(text.clone()),
+                    Prim::Text {
+                        text, bg: Some(_), ..
+                    } => Some(text.clone()),
                     _ => None,
                 })
                 .collect()
@@ -964,7 +996,9 @@ mod tests {
         assert_eq!(boxed(&f), ["100.00"]);
         // A crosshair 5 px below the 120 tick hides it too.
         let y120 = vp.y_of_price(120.0);
-        let f = run(&s, &vp, &layout, |i| i.crosshair = Some((300.0, y120 + 5.0)));
+        let f = run(&s, &vp, &layout, |i| {
+            i.crosshair = Some((300.0, y120 + 5.0))
+        });
         let mut ticks = plain(&f);
         ticks.sort();
         assert_eq!(ticks, ["140.00", "60.00", "80.00"]);
@@ -973,7 +1007,9 @@ mod tests {
         let grid = f
             .plot
             .iter()
-            .filter(|p| matches!(p, Prim::Line { a, b, .. } if a.1 == b.1 && (a.1 - y120).abs() < 0.01))
+            .filter(
+                |p| matches!(p, Prim::Line { a, b, .. } if a.1 == b.1 && (a.1 - y120).abs() < 0.01),
+            )
             .count();
         assert!(grid >= 1);
     }

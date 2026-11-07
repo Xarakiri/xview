@@ -388,6 +388,9 @@ impl ChartState {
         match place_click(self.tool, Some(first), self.anchor_at(c, self.last_mods))? {
             PlaceResult::Done(kind) => Some(Drawing {
                 id: DrawingId(u64::MAX),
+                name: None,
+                locked: false,
+                hidden: false,
                 kind,
                 style: Style::default(),
             }),
@@ -947,6 +950,9 @@ mod tests {
         let (a, b) = (at(s, (200.0, 150.0)), at(s, (400.0, 100.0)));
         s.set_drawings(vec![Drawing {
             id: DrawingId(1),
+            name: None,
+            locked: false,
+            hidden: false,
             kind: DrawingKind::TrendLine { a, b },
             style: Style::default(),
         }]);
@@ -1198,8 +1204,9 @@ mod tests {
         let st = Style {
             color: 0xFF0000FF,
             width: 3,
+            ..Style::default()
         };
-        let fx = s.set_selected_style(st);
+        let fx = s.set_selected_style(st.clone());
         assert_eq!(fx, vec![ChartEffect::DrawingsChanged]);
         assert_eq!(s.drawings.get(id).unwrap().style, st);
         let fx = s.clear_drawings();

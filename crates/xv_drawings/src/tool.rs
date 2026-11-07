@@ -4,6 +4,7 @@ use crate::model::*;
 pub enum Tool {
     Cursor,
     TrendLine,
+    ExtendedLine,
     Ray,
     HorizontalLine,
     VerticalLine,
@@ -28,10 +29,53 @@ pub fn place_click(tool: Tool, first: Option<Anchor>, at: Anchor) -> Option<Plac
         Tool::VerticalLine => PlaceResult::Done(DrawingKind::VerticalLine {
             time_ms: at.time_ms,
         }),
-        Tool::TrendLine => two(|a, b| DrawingKind::TrendLine { a, b }),
+        Tool::TrendLine | Tool::ExtendedLine => two(|a, b| DrawingKind::TrendLine { a, b }),
         Tool::Ray => two(|a, b| DrawingKind::Ray { a, b }),
         Tool::Rectangle => two(|a, b| DrawingKind::Rectangle { a, b }),
     })
+}
+
+impl Tool {
+    /// Stable snake_case name.
+    pub fn key(self) -> &'static str {
+        match self {
+            Tool::Cursor => "cursor",
+            Tool::TrendLine => "trend_line",
+            Tool::ExtendedLine => "extended_line",
+            Tool::Ray => "ray",
+            Tool::HorizontalLine => "horizontal_line",
+            Tool::VerticalLine => "vertical_line",
+            Tool::Rectangle => "rectangle",
+        }
+    }
+
+    /// The style a new drawing of this tool starts with.
+    pub fn default_style(self) -> Style {
+        match self {
+            Tool::ExtendedLine => Style {
+                extend: Extend::Both,
+                ..Style::default()
+            },
+            Tool::HorizontalLine => Style {
+                price_labels: true,
+                ..Style::default()
+            },
+            _ => Style::default(),
+        }
+    }
+}
+
+/// The tool that would create `d`: a trend line extended both ways is an
+/// extended line.
+pub fn tool_of(d: &Drawing) -> Tool {
+    match d.kind {
+        DrawingKind::TrendLine { .. } if d.style.extend == Extend::Both => Tool::ExtendedLine,
+        DrawingKind::TrendLine { .. } => Tool::TrendLine,
+        DrawingKind::Ray { .. } => Tool::Ray,
+        DrawingKind::HorizontalLine { .. } => Tool::HorizontalLine,
+        DrawingKind::VerticalLine { .. } => Tool::VerticalLine,
+        DrawingKind::Rectangle { .. } => Tool::Rectangle,
+    }
 }
 
 #[cfg(test)]
@@ -71,5 +115,42 @@ mod tests {
             Some(PlaceResult::Done(DrawingKind::Rectangle { a: p, b: q }))
         );
         assert_eq!(place_click(Tool::Cursor, None, p), None);
+    }
+
+    #[test]
+    fn extended_line_tool_places_trendline() {
+        let (p, q) = (a(1, 1.0), a(2, 2.0));
+        assert_eq!(
+            place_click(Tool::ExtendedLine, None, p),
+            Some(PlaceResult::Pending(p))
+        );
+        assert_eq!(
+            place_click(Tool::ExtendedLine, Some(p), q),
+            Some(PlaceResult::Done(DrawingKind::TrendLine { a: p, b: q }))
+        );
+        assert_eq!(Tool::ExtendedLine.default_style().extend, Extend::Both);
+        assert!(Tool::HorizontalLine.default_style().price_labels);
+        assert_eq!(Tool::Ray.default_style(), Style::default());
+        assert_eq!(Tool::ExtendedLine.key(), "extended_line");
+        assert_eq!(Tool::HorizontalLine.key(), "horizontal_line");
+    }
+
+    #[test]
+    fn tool_of_roundtrip() {
+        let (p, q) = (a(1, 1.0), a(2, 2.0));
+        for tool in [
+            Tool::TrendLine,
+            Tool::ExtendedLine,
+            Tool::Ray,
+            Tool::HorizontalLine,
+            Tool::VerticalLine,
+            Tool::Rectangle,
+        ] {
+            let Some(PlaceResult::Done(kind)) = place_click(tool, Some(p), q) else {
+                panic!("{tool:?} did not finish");
+            };
+            let d = Drawing::new(DrawingId(1), kind, tool.default_style());
+            assert_eq!(tool_of(&d), tool);
+        }
     }
 }

@@ -1,0 +1,82 @@
+{
+  "version": 1,
+  "symbol": "binance:BTCUSDT",
+  "drawings": [
+    {
+      "id": 1,
+      "kind": {
+        "type": "trend_line",
+        "a": {
+          "time_ms": 1000,
+          "price": 1.5
+        },
+        "b": {
+          "time_ms": 2000,
+          "price": 2.5
+        }
+      },
+      "style": {
+        "color": 997189887,
+        "width": 1
+      }
+    },
+    {
+      "id": 2,
+      "kind": {
+        "type": "ray",
+        "a": {
+          "time_ms": 1000,
+          "price": 1.5
+        },
+        "b": {
+          "time_ms": 2000,
+          "price": 2.5
+        }
+      },
+      "style": {
+        "color": 3845731839,
+        "width": 2
+      }
+    },
+    {
+      "id": 3,
+      "kind": {
+        "type": "horizontal_line",
+        "price": 3.25
+      },
+      "style": {
+        "color": 1134577663,
+        "width": 3
+      }
+    },
+    {
+      "id": 4,
+      "kind": {
+        "type": "vertical_line",
+        "time_ms": 5000
+      },
+      "style": {
+        "color": 4220256511,
+        "width": 4
+      }
+    },
+    {
+      "id": 5,
+      "kind": {
+        "type": "rectangle",
+        "a": {
+          "time_ms": 1000,
+          "price": 1.5
+        },
+        "b": {
+          "time_ms": 2000,
+          "price": 2.5
+        }
+      },
+      "style": {
+        "color": 2384767743,
+        "width": 1
+      }
+    }
+  ]
+}
