@@ -65,13 +65,13 @@ fn decimals_of(tick_size: f64) -> usize {
     if !tick_size.is_finite() || tick_size <= 0.0 {
         return 2;
     }
-    for d in 0..=10 {
+    for d in 0..=12 {
         let s = tick_size * 10f64.powi(d);
-        if (s - s.round()).abs() < 1e-7 * s.max(1.0) {
+        if s >= 0.5 && (s - s.round()).abs() < 1e-6 * s {
             return d as usize;
         }
     }
-    10
+    12
 }
 
 /// Price with the tick size's decimals and a `,` thousands separator.
@@ -294,6 +294,24 @@ mod tests {
         assert_eq!(format_price(-1234567.0, 1.0), "-1,234,567");
         assert_eq!(format_price(-0.001, 0.01), "0.00");
         assert_eq!(format_price(f64::NAN, 0.01), "-");
+        assert_eq!(format_price(0.00001234, 1e-8), "0.00001234");
+        assert_eq!(format_price(0.000000015, 5e-9), "0.000000015");
+        assert_eq!(format_price(10.25, 0.25), "10.25");
+        assert_eq!(format_price(1234.0, 5.0), "1,234");
+    }
+
+    #[test]
+    fn price_ticks_for_tiny_tick_size() {
+        let t = price_ticks(
+            PriceRange {
+                min: 0.0000120,
+                max: 0.0000130,
+            },
+            600.0,
+            1e-8,
+        );
+        assert!(!t.is_empty() && t.iter().all(|v| v.is_finite()));
+        assert!(t.len() < 3 || t.windows(2).all(|w| w[1] - w[0] >= 1e-8 * (1.0 - 1e-6)));
     }
 
     #[test]
