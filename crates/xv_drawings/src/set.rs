@@ -77,6 +77,7 @@ impl DrawingSet {
             return false;
         };
         f(&mut d);
+        d.id = id;
         if !d.is_finite() {
             return false;
         }
@@ -137,7 +138,7 @@ impl DrawingSet {
         if !d.is_finite() {
             return;
         }
-        self.next_id = self.next_id.max(d.id.0 + 1);
+        self.next_id = self.next_id.max(d.id.0.saturating_add(1));
         match self.items.iter_mut().find(|x| x.id == d.id) {
             Some(slot) => *slot = d,
             None => self.items.push(d),
@@ -382,5 +383,20 @@ mod tests {
         assert_eq!(s.get(a).unwrap(), &snap);
         assert!(undo_len >= 4 && redo_len == 0);
         assert!(s.snapshot(DrawingId(99)).is_none());
+    }
+
+    #[test]
+    fn restore_without_undo_max_id_does_not_overflow() {
+        let (mut s, _) = three();
+        s.restore_without_undo(Drawing::new(DrawingId(u64::MAX), k(5.0), Style::default()));
+        assert!(s.get(DrawingId(u64::MAX)).is_some());
+    }
+
+    #[test]
+    fn update_cannot_change_id() {
+        let (mut s, [a, ..]) = three();
+        assert!(s.update(a, |d| d.id = DrawingId(42)));
+        assert!(s.get(a).is_some());
+        assert!(s.get(DrawingId(42)).is_none());
     }
 }

@@ -13,7 +13,10 @@ pub use frame::{
     TIME_AXIS_HEIGHT, TextAlign, build_frame,
 };
 pub use projector::ChartProjector;
-pub use snap::snap_anchor;
+pub use snap::{
+    MAGNET_WEAK_PX, MagnetMode, constrain_angle, constrain_square, snap_anchor, snap_high_low,
+    snap_ohlc,
+};
 pub use state::{ChartEffect, ChartKey, ChartState, Mods, OLDER_THRESHOLD_BARS};
 pub use ticks::{TimeTick, format_crosshair_time, format_price, price_ticks, time_ticks};
 pub use time_index::{index_to_time, time_to_index};

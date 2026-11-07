@@ -16,8 +16,8 @@ use gpui::{
     fill, point, prelude::*, px, quad, size, transparent_black,
 };
 use xv_chart::{
-    ChartColors, ChartEffect, ChartKey, ChartLayout, ChartState, Frame, Legend, Mods, Prim, RectF,
-    TextAlign,
+    ChartColors, ChartEffect, ChartKey, ChartLayout, ChartState, Frame, Legend, MagnetMode, Mods,
+    Prim, RectF, TextAlign,
 };
 use xv_core::{Candle, Series};
 
@@ -100,7 +100,9 @@ impl ChartView {
         cx: &mut Context<Self>,
     ) -> Self {
         // The real size arrives in the first prepaint.
-        let state = ChartState::new(series, 0.0, 0.0);
+        let mut state = ChartState::new(series, 0.0, 0.0);
+        // Until the magnet mode can be chosen, "magnet on" keeps snapping always.
+        state.magnet_mode = MagnetMode::Strong;
         let activation = cx.observe_window_activation(window, |this, window, cx| {
             if !window.is_window_active() {
                 this.state.mouse_left();
@@ -125,9 +127,9 @@ impl ChartView {
     /// Replaces the series (the loader landed a new symbol or timeframe).
     pub fn set_series(&mut self, s: Series, cx: &mut Context<Self>) {
         self.dragging = false;
-        self.state.set_series(s);
+        let mut fx = self.state.set_series(s);
         // A wide window may already show the left edge of the first page.
-        let fx = self.state.check_need_older();
+        fx.extend(self.state.check_need_older());
         self.apply_effects(fx, cx);
     }
 
@@ -179,6 +181,8 @@ impl ChartView {
                 ChartEffect::DrawingsChanged => ChartViewEvent::DrawingsChanged,
                 ChartEffect::ToolFinished => ChartViewEvent::ToolFinished,
                 ChartEffect::SelectionChanged => ChartViewEvent::SelectionChanged,
+                // Not wired yet (settings dialog, last-used style persistence).
+                ChartEffect::OpenSettings(_) | ChartEffect::ToolStylesChanged => continue,
             });
         }
         cx.notify();
