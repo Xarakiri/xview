@@ -1,0 +1,90 @@
+use serde::{Deserialize, Serialize};
+
+#[derive(Copy, Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Anchor {
+    pub time_ms: i64,
+    pub price: f64,
+}
+
+impl Anchor {
+    pub fn is_finite(&self) -> bool {
+        self.price.is_finite()
+    }
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct DrawingId(pub u64);
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum DrawingKind {
+    TrendLine { a: Anchor, b: Anchor },
+    Ray { a: Anchor, b: Anchor },
+    HorizontalLine { price: f64 },
+    VerticalLine { time_ms: i64 },
+    Rectangle { a: Anchor, b: Anchor },
+}
+
+impl DrawingKind {
+    /// Whether every price is finite. JSON has no NaN or infinity (serde_json
+    /// writes them as null), so a non-finite drawing would make the saved
+    /// file unreadable.
+    pub fn is_finite(&self) -> bool {
+        match self {
+            DrawingKind::TrendLine { a, b }
+            | DrawingKind::Ray { a, b }
+            | DrawingKind::Rectangle { a, b } => a.is_finite() && b.is_finite(),
+            DrawingKind::HorizontalLine { price } => price.is_finite(),
+            DrawingKind::VerticalLine { .. } => true,
+        }
+    }
+}
+
+/// XView's own drawing colors, 0xRRGGBBAA. The first (the default) is the
+/// app accent (`AppTheme::light().accent`, `ChartColors::light().selection`).
+pub const PALETTE: [u32; 8] = [
+    0x3B6FE8FF, 0xE53935FF, 0x43A047FF, 0xFB8C00FF, 0x8E24AAFF, 0x00ACC1FF, 0xD81B60FF, 0x757575FF,
+];
+
+#[derive(Copy, Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Style {
+    /// 0xRRGGBBAA
+    pub color: u32,
+    /// 1..=4
+    pub width: u8,
+}
+
+impl Default for Style {
+    fn default() -> Self {
+        Style {
+            color: PALETTE[0],
+            width: 2,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Drawing {
+    pub id: DrawingId,
+    pub kind: DrawingKind,
+    pub style: Style,
+}
+
+impl Drawing {
+    /// Whether the drawing can be saved and read back (see
+    /// `DrawingKind::is_finite`; `Style` holds only integers).
+    pub fn is_finite(&self) -> bool {
+        self.kind.is_finite()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_style_uses_first_palette_color() {
+        let s = Style::default();
+        assert_eq!((s.color, s.width), (0x3B6FE8FF, 2));
+    }
+}
