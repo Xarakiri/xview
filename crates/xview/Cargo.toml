@@ -9,3 +9,6 @@ rust-version.workspace = true
 gpui.workspace = true
 gpui_platform.workspace = true
 gpui_tokio.workspace = true
+xv_chart = { path = "../xv_chart" }
+xv_core = { path = "../xv_core" }
+xv_store = { path = "../xv_store" }

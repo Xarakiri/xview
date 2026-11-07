@@ -1,0 +1,738 @@
+//! GPUI chart view: paints `xv_chart::Frame` primitives in a `canvas` and
+//! forwards mouse, scroll, pinch and keyboard input to the GPUI-free
+//! `ChartState`. All chart logic lives in `xv_chart`; this is the thin layer.
+
+use std::{
+    cell::RefCell,
+    rc::Rc,
+    time::{Duration, Instant},
+};
+
+use gpui::{
+    App, Bounds, ContentMask, Context, DispatchPhase, EventEmitter, FocusHandle, Focusable, Font,
+    FontWeight, Hitbox, HitboxBehavior, Hsla, KeyBinding, Modifiers, MouseButton, MouseDownEvent,
+    MouseExitEvent, MouseMoveEvent, MouseUpEvent, PathBuilder, PinchEvent, Pixels, Point, Render,
+    ScrollDelta, ScrollEvent, SharedString, Subscription, TextRun, Window, actions, canvas, div,
+    fill, point, prelude::*, px, quad, size, transparent_black,
+};
+use xv_chart::{
+    ChartColors, ChartEffect, ChartKey, ChartLayout, ChartState, Frame, Legend, Mods, Prim, RectF,
+    TextAlign,
+};
+use xv_core::Series;
+
+use crate::theme::u32_to_hsla;
+
+actions!(chart, [Delete, Cancel, Undo, Redo]);
+
+/// Key context of the chart; the chart key bindings only apply inside it.
+pub const KEY_CONTEXT: &str = "ChartView";
+
+/// Pixels per line for `ScrollDelta::Lines` (mouse wheels).
+const LINE_SCROLL_PX: f32 = 20.0;
+const AXIS_FONT_SIZE: f32 = 12.0;
+const TITLE_FONT_SIZE: f32 = 14.0;
+/// Line box used to vertically center axis text on its anchor.
+const TEXT_LINE_HEIGHT: f32 = 16.0;
+/// Background quad behind labelled axis text.
+const LABEL_HEIGHT: f32 = 18.0;
+const LABEL_PAD_X: f32 = 4.0;
+const LABEL_RADIUS: f32 = 3.0;
+const HANDLE_RADIUS: f32 = 4.5;
+const HANDLE_BORDER: f32 = 1.5;
+const DASH: [f32; 2] = [4.0, 4.0];
+const LEGEND_X: f32 = 10.0;
+const LEGEND_Y: f32 = 16.0;
+const LEGEND_GAP: f32 = 12.0;
+/// Frames per line of the `XVIEW_FRAME_LOG` paint-time log.
+const FRAME_LOG_EVERY: u32 = 60;
+
+pub fn bind_keys(cx: &mut App) {
+    let ctx = Some(KEY_CONTEXT);
+    cx.bind_keys([
+        KeyBinding::new("backspace", Delete, ctx),
+        KeyBinding::new("delete", Delete, ctx),
+        KeyBinding::new("escape", Cancel, ctx),
+        KeyBinding::new("cmd-z", Undo, ctx),
+        KeyBinding::new("cmd-shift-z", Redo, ctx),
+    ]);
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum ChartViewEvent {
+    NeedOlder(i64),
+    DrawingsChanged,
+    ToolFinished,
+    SelectionChanged,
+}
+
+pub struct ChartView {
+    pub state: ChartState,
+    pub source_name: SharedString,
+    focus: FocusHandle,
+    colors: ChartColors,
+    /// A left-button press started on the chart and has not been released, so
+    /// moves and the release are forwarded even outside the canvas.
+    dragging: bool,
+    /// Element size last passed to `ChartState::set_size`.
+    size: Option<(f32, f32)>,
+    stats: Option<Rc<RefCell<FrameStats>>>,
+    _activation: Subscription,
+}
+
+impl EventEmitter<ChartViewEvent> for ChartView {}
+
+impl Focusable for ChartView {
+    fn focus_handle(&self, _: &App) -> FocusHandle {
+        self.focus.clone()
+    }
+}
+
+impl ChartView {
+    pub fn new(
+        series: Series,
+        source_name: impl Into<SharedString>,
+        colors: ChartColors,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        // The real size arrives in the first prepaint.
+        let state = ChartState::new(series, 0.0, 0.0);
+        let activation = cx.observe_window_activation(window, |this, window, cx| {
+            if !window.is_window_active() {
+                this.state.mouse_left();
+                cx.notify();
+            }
+        });
+        let stats = std::env::var_os("XVIEW_FRAME_LOG")
+            .is_some_and(|v| !v.is_empty() && v != "0")
+            .then(|| Rc::new(RefCell::new(FrameStats::default())));
+        ChartView {
+            state,
+            source_name: source_name.into(),
+            focus: cx.focus_handle(),
+            colors,
+            dragging: false,
+            size: None,
+            stats,
+            _activation: activation,
+        }
+    }
+
+    // Called by the loader (Task 15) and the theme toggle (Task 14).
+    #[allow(dead_code)]
+    pub fn set_series(&mut self, s: Series, cx: &mut Context<Self>) {
+        self.dragging = false;
+        self.state.set_series(s);
+        cx.notify();
+    }
+
+    #[allow(dead_code)]
+    pub fn set_colors(&mut self, colors: ChartColors, cx: &mut Context<Self>) {
+        self.colors = colors;
+        cx.notify();
+    }
+
+    /// Emits every effect as a `ChartViewEvent` and repaints. Called after
+    /// every forwarded input, since even effect-free input (crosshair, drag
+    /// previews) changes what is drawn.
+    pub fn apply_effects(&mut self, fx: Vec<ChartEffect>, cx: &mut Context<Self>) {
+        for e in fx {
+            cx.emit(match e {
+                ChartEffect::NeedOlder { end_before_ms } => {
+                    ChartViewEvent::NeedOlder(end_before_ms)
+                }
+                ChartEffect::DrawingsChanged => ChartViewEvent::DrawingsChanged,
+                ChartEffect::ToolFinished => ChartViewEvent::ToolFinished,
+                ChartEffect::SelectionChanged => ChartViewEvent::SelectionChanged,
+            });
+        }
+        cx.notify();
+    }
+
+    fn key(&mut self, k: ChartKey, cx: &mut Context<Self>) {
+        let fx = self.state.key(k);
+        self.apply_effects(fx, cx);
+    }
+
+    /// Prepaint: syncs the size and builds the frame.
+    fn prepare(
+        &mut self,
+        bounds: Bounds<Pixels>,
+        cx: &mut Context<Self>,
+    ) -> (Frame, ChartColors, ChartLayout) {
+        let sz = (f32::from(bounds.size.width), f32::from(bounds.size.height));
+        if self.size != Some(sz) {
+            self.size = Some(sz);
+            self.state.set_size(sz.0, sz.1);
+            // A resize can expose the left edge of the loaded history. Emit
+            // without notifying: this frame already reflects the new size.
+            for e in self.state.check_need_older() {
+                if let ChartEffect::NeedOlder { end_before_ms } = e {
+                    cx.emit(ChartViewEvent::NeedOlder(end_before_ms));
+                }
+            }
+        }
+        let frame = self.state.frame(&self.colors, &self.source_name);
+        (frame, self.colors.clone(), self.state.layout)
+    }
+}
+
+fn mods(m: &Modifiers) -> Mods {
+    Mods {
+        shift: m.shift,
+        cmd: m.platform,
+        alt: m.alt,
+    }
+}
+
+fn scroll_px(d: &ScrollDelta) -> (f32, f32) {
+    match d {
+        ScrollDelta::Pixels(p) => (f32::from(p.x), f32::from(p.y)),
+        ScrollDelta::Lines(l) => (l.x * LINE_SCROLL_PX, l.y * LINE_SCROLL_PX),
+    }
+}
+
+struct Prepared {
+    frame: Frame,
+    colors: ChartColors,
+    layout: ChartLayout,
+    hitbox: Hitbox,
+    build: Duration,
+}
+
+impl Render for ChartView {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let view = cx.entity().downgrade();
+        let paint_view = view.clone();
+        let stats = self.stats.clone();
+        div()
+            .key_context(KEY_CONTEXT)
+            .track_focus(&self.focus)
+            .on_action(cx.listener(|this, _: &Delete, _, cx| this.key(ChartKey::Delete, cx)))
+            .on_action(cx.listener(|this, _: &Cancel, _, cx| this.key(ChartKey::Escape, cx)))
+            .on_action(cx.listener(|this, _: &Undo, _, cx| this.key(ChartKey::Undo, cx)))
+            .on_action(cx.listener(|this, _: &Redo, _, cx| this.key(ChartKey::Redo, cx)))
+            .size_full()
+            .child(
+                canvas(
+                    move |bounds, window, cx| {
+                        let t0 = Instant::now();
+                        let hitbox = window.insert_hitbox(bounds, HitboxBehavior::Normal);
+                        let (frame, colors, layout) =
+                            view.update(cx, |this, cx| this.prepare(bounds, cx)).ok()?;
+                        Some(Prepared {
+                            frame,
+                            colors,
+                            layout,
+                            hitbox,
+                            build: t0.elapsed(),
+                        })
+                    },
+                    move |bounds, prepared, window, cx| {
+                        let Some(prepared) = prepared else { return };
+                        let t0 = Instant::now();
+                        paint_frame(bounds, &prepared, window, cx);
+                        register_input(bounds, &prepared.hitbox, &paint_view, window);
+                        if let Some(stats) = &stats {
+                            let prims = prepared.frame.plot.len()
+                                + prepared.frame.price_axis.len()
+                                + prepared.frame.time_axis.len();
+                            stats
+                                .borrow_mut()
+                                .record(prepared.build, t0.elapsed(), prims);
+                        }
+                    },
+                )
+                .size_full(),
+            )
+    }
+}
+
+// ---- painting ----
+
+fn rect_bounds(origin: Point<Pixels>, r: RectF) -> Bounds<Pixels> {
+    Bounds {
+        origin: origin + point(px(r.x), px(r.y)),
+        size: size(px(r.w), px(r.h)),
+    }
+}
+
+fn paint_frame(bounds: Bounds<Pixels>, p: &Prepared, window: &mut Window, cx: &mut App) {
+    let painter = Painter {
+        origin: bounds.origin,
+        scale: window.scale_factor(),
+        font: window.text_style().font(),
+        background: u32_to_hsla(p.colors.background),
+    };
+    let c = &p.colors;
+    let l = &p.layout;
+    window.paint_quad(fill(bounds, painter.background));
+
+    let plot_mask = Some(ContentMask {
+        bounds: rect_bounds(bounds.origin, l.plot),
+    });
+    window.with_content_mask(plot_mask, |window| {
+        for prim in &p.frame.plot {
+            painter.prim(prim, window, cx);
+        }
+    });
+
+    // Axis separators.
+    let sep = u32_to_hsla(c.grid);
+    let (px_, py_) = (l.plot.x + l.plot.w, l.plot.y + l.plot.h);
+    painter.line(
+        (px_, l.plot.y),
+        (px_, py_ + l.time_axis.h),
+        sep,
+        1.0,
+        false,
+        window,
+    );
+    painter.line(
+        (l.plot.x, py_),
+        (px_ + l.price_axis.w, py_),
+        sep,
+        1.0,
+        false,
+        window,
+    );
+
+    for (rect, prims) in [
+        (l.price_axis, &p.frame.price_axis),
+        (l.time_axis, &p.frame.time_axis),
+    ] {
+        let mask = Some(ContentMask {
+            bounds: rect_bounds(bounds.origin, rect),
+        });
+        window.with_content_mask(mask, |window| {
+            for prim in prims {
+                painter.prim(prim, window, cx);
+            }
+        });
+    }
+
+    window.with_content_mask(plot_mask, |window| {
+        painter.legend(&p.frame.legend, l.plot, c, window, cx);
+    });
+}
+
+struct Painter {
+    origin: Point<Pixels>,
+    scale: f32,
+    font: Font,
+    background: Hsla,
+}
+
+impl Painter {
+    fn snap(&self, v: f32) -> f32 {
+        (v * self.scale).round() / self.scale
+    }
+
+    /// Snaps the center of a line of logical width `w` so its edges fall on
+    /// device pixels. Returns (snapped center, snapped width).
+    fn snap_line(&self, c: f32, w: f32) -> (f32, f32) {
+        let wd = (w * self.scale).round().max(1.0);
+        (
+            (((c * self.scale) - wd / 2.0).round() + wd / 2.0) / self.scale,
+            wd / self.scale,
+        )
+    }
+
+    /// Element-relative rect to window bounds, edges snapped to device
+    /// pixels and at least one device pixel in each dimension.
+    fn snapped(&self, x: f32, y: f32, w: f32, h: f32) -> Bounds<Pixels> {
+        let min = 1.0 / self.scale;
+        let (x0, y0) = (self.snap(x), self.snap(y));
+        let x1 = self.snap(x + w).max(x0 + min);
+        let y1 = self.snap(y + h).max(y0 + min);
+        Bounds {
+            origin: self.origin + point(px(x0), px(y0)),
+            size: size(px(x1 - x0), px(y1 - y0)),
+        }
+    }
+
+    fn at(&self, p: (f32, f32)) -> Point<Pixels> {
+        self.origin + point(px(p.0), px(p.1))
+    }
+
+    fn prim(&self, prim: &Prim, window: &mut Window, cx: &mut App) {
+        match prim {
+            Prim::Rect { r, color } => {
+                window.paint_quad(fill(self.snapped(r.x, r.y, r.w, r.h), u32_to_hsla(*color)));
+            }
+            Prim::StrokeRect { r, color, width } => {
+                window.paint_quad(quad(
+                    self.snapped(r.x, r.y, r.w, r.h),
+                    px(0.),
+                    transparent_black(),
+                    px(*width),
+                    u32_to_hsla(*color),
+                    Default::default(),
+                ));
+            }
+            Prim::Line {
+                a,
+                b,
+                color,
+                width,
+                dashed,
+            } => self.line(*a, *b, u32_to_hsla(*color), *width, *dashed, window),
+            Prim::Text {
+                pos,
+                text,
+                color,
+                align,
+                bg,
+            } => {
+                self.text(
+                    *pos,
+                    text,
+                    u32_to_hsla(*color),
+                    *align,
+                    bg.map(u32_to_hsla),
+                    window,
+                    cx,
+                );
+            }
+            Prim::Handle { center, color } => {
+                let r = HANDLE_RADIUS;
+                window.paint_quad(quad(
+                    Bounds {
+                        origin: self.at((center.0 - r, center.1 - r)),
+                        size: size(px(2. * r), px(2. * r)),
+                    },
+                    px(r),
+                    // Hollow handle: chart background inside, colored ring.
+                    self.background,
+                    px(HANDLE_BORDER),
+                    u32_to_hsla(*color),
+                    Default::default(),
+                ));
+            }
+        }
+    }
+
+    fn line(
+        &self,
+        a: (f32, f32),
+        b: (f32, f32),
+        color: Hsla,
+        width: f32,
+        dashed: bool,
+        window: &mut Window,
+    ) {
+        let (mut a, mut b) = (a, b);
+        let vertical = a.0 == b.0;
+        let horizontal = a.1 == b.1;
+        if !dashed && (vertical || horizontal) {
+            // Axis-aligned solid lines are quads: crisp and far cheaper than
+            // tessellated paths (every candle wick takes this path).
+            let (c, w) = self.snap_line(if vertical { a.0 } else { a.1 }, width);
+            let bounds = if vertical {
+                let (y0, y1) = (a.1.min(b.1), a.1.max(b.1));
+                self.snapped(c - w / 2.0, y0, w, y1 - y0)
+            } else {
+                let (x0, x1) = (a.0.min(b.0), a.0.max(b.0));
+                self.snapped(x0, c - w / 2.0, x1 - x0, w)
+            };
+            window.paint_quad(fill(bounds, color));
+            return;
+        }
+        if vertical {
+            let (c, _) = self.snap_line(a.0, width);
+            (a.0, b.0) = (c, c);
+        } else if horizontal {
+            let (c, _) = self.snap_line(a.1, width);
+            (a.1, b.1) = (c, c);
+        }
+        let mut builder = PathBuilder::stroke(px(width));
+        if dashed {
+            builder = builder.dash_array(&[px(DASH[0]), px(DASH[1])]);
+        }
+        builder.move_to(self.at(a));
+        builder.line_to(self.at(b));
+        if let Ok(path) = builder.build() {
+            window.paint_path(path, color);
+        }
+    }
+
+    fn shape(
+        &self,
+        text: &str,
+        font: &Font,
+        font_size: f32,
+        runs: &[(usize, Hsla)],
+        window: &mut Window,
+    ) -> gpui::ShapedLine {
+        let runs: Vec<TextRun> = runs
+            .iter()
+            .map(|&(len, color)| TextRun {
+                len,
+                font: font.clone(),
+                color,
+                background_color: None,
+                underline: None,
+                strikethrough: None,
+            })
+            .collect();
+        window.text_system().shape_line(
+            SharedString::from(text.to_owned()),
+            px(font_size),
+            &runs,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn text(
+        &self,
+        pos: (f32, f32),
+        text: &str,
+        color: Hsla,
+        align: TextAlign,
+        bg: Option<Hsla>,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        if text.is_empty() {
+            return;
+        }
+        let line = self.shape(
+            text,
+            &self.font,
+            AXIS_FONT_SIZE,
+            &[(text.len(), color)],
+            window,
+        );
+        let w = f32::from(line.width());
+        let x = match align {
+            TextAlign::Left => pos.0,
+            TextAlign::Center => pos.0 - w / 2.0,
+            TextAlign::Right => pos.0 - w,
+        };
+        if let Some(bg) = bg {
+            let (bx, by) = (x - LABEL_PAD_X, pos.1 - LABEL_HEIGHT / 2.0);
+            window.paint_quad(
+                fill(
+                    self.snapped(bx, by, w + 2.0 * LABEL_PAD_X, LABEL_HEIGHT),
+                    bg,
+                )
+                .corner_radii(px(LABEL_RADIUS)),
+            );
+        }
+        let _ = line.paint(
+            self.at((x, pos.1 - TEXT_LINE_HEIGHT / 2.0)),
+            px(TEXT_LINE_HEIGHT),
+            gpui::TextAlign::Left,
+            None,
+            window,
+            cx,
+        );
+    }
+
+    /// Top-left legend: semibold title, then O/H/L/C/V and the change.
+    fn legend(&self, lg: &Legend, plot: RectF, c: &ChartColors, window: &mut Window, cx: &mut App) {
+        let line_h = px(20.);
+        let y = plot.y + LEGEND_Y;
+        let mut title_font = self.font.clone();
+        title_font.weight = FontWeight::SEMIBOLD;
+        let title = self.shape(
+            &lg.title,
+            &title_font,
+            TITLE_FONT_SIZE,
+            &[(lg.title.len(), u32_to_hsla(c.text))],
+            window,
+        );
+        let x = plot.x + LEGEND_X;
+        let _ = title.paint(
+            self.at((x, y - 10.0)),
+            line_h,
+            gpui::TextAlign::Left,
+            None,
+            window,
+            cx,
+        );
+
+        let muted = u32_to_hsla(c.muted_text);
+        let value = u32_to_hsla(if lg.up { c.up } else { c.down });
+        let mut text = String::new();
+        let mut runs: Vec<(usize, Hsla)> = Vec::new();
+        let mut push = |s: &str, color: Hsla| {
+            text.push_str(s);
+            runs.push((s.len(), color));
+        };
+        for (label, v) in [
+            ("O ", &lg.o),
+            ("  H ", &lg.h),
+            ("  L ", &lg.l),
+            ("  C ", &lg.c),
+        ] {
+            push(label, muted);
+            push(v, value);
+        }
+        push("  ", muted);
+        push(&lg.change, value);
+        push("  Vol ", muted);
+        push(&lg.v, muted);
+        let row = self.shape(&text, &self.font, AXIS_FONT_SIZE, &runs, window);
+        let x = x + f32::from(title.width()) + LEGEND_GAP;
+        let _ = row.paint(
+            self.at((x, y - 10.0)),
+            line_h,
+            gpui::TextAlign::Left,
+            None,
+            window,
+            cx,
+        );
+    }
+}
+
+// ---- input ----
+
+fn register_input(
+    bounds: Bounds<Pixels>,
+    hitbox: &Hitbox,
+    view: &gpui::WeakEntity<ChartView>,
+    window: &mut Window,
+) {
+    let origin = bounds.origin;
+    let rel = move |p: Point<Pixels>| (f32::from(p.x - origin.x), f32::from(p.y - origin.y));
+
+    {
+        let (view, hitbox) = (view.clone(), hitbox.clone());
+        window.on_mouse_event(move |e: &MouseDownEvent, phase, window, cx| {
+            if phase != DispatchPhase::Bubble
+                || e.button != MouseButton::Left
+                || !hitbox.is_hovered(window)
+            {
+                return;
+            }
+            let _ = view.update(cx, |this, cx| {
+                window.focus(&this.focus, cx);
+                this.dragging = true;
+                let fx = this
+                    .state
+                    .mouse_down(rel(e.position), mods(&e.modifiers), e.click_count);
+                this.apply_effects(fx, cx);
+            });
+        });
+    }
+    {
+        let (view, hitbox) = (view.clone(), hitbox.clone());
+        window.on_mouse_event(move |e: &MouseMoveEvent, phase, window, cx| {
+            if phase != DispatchPhase::Bubble {
+                return;
+            }
+            let hovered = hitbox.is_hovered(window);
+            let _ = view.update(cx, |this, cx| {
+                if this.dragging || hovered {
+                    let pressed = e.pressed_button == Some(MouseButton::Left);
+                    if !pressed {
+                        // Release was lost (e.g. outside the window); the
+                        // state finishes the drag like a mouse-up.
+                        this.dragging = false;
+                    }
+                    let fx = this
+                        .state
+                        .mouse_move(rel(e.position), mods(&e.modifiers), pressed);
+                    this.apply_effects(fx, cx);
+                } else if this.state.crosshair.is_some() {
+                    this.state.mouse_left();
+                    cx.notify();
+                }
+            });
+        });
+    }
+    {
+        let (view, hitbox) = (view.clone(), hitbox.clone());
+        window.on_mouse_event(move |e: &MouseUpEvent, phase, window, cx| {
+            if phase != DispatchPhase::Bubble || e.button != MouseButton::Left {
+                return;
+            }
+            let hovered = hitbox.is_hovered(window);
+            let _ = view.update(cx, |this, cx| {
+                if this.dragging || hovered {
+                    this.dragging = false;
+                    let fx = this.state.mouse_up(rel(e.position), mods(&e.modifiers));
+                    this.apply_effects(fx, cx);
+                }
+            });
+        });
+    }
+    {
+        let view = view.clone();
+        window.on_mouse_event(move |_: &MouseExitEvent, phase, _window, cx| {
+            if phase != DispatchPhase::Bubble {
+                return;
+            }
+            let _ = view.update(cx, |this, cx| {
+                this.state.mouse_left();
+                cx.notify();
+            });
+        });
+    }
+    {
+        let (view, hitbox) = (view.clone(), hitbox.clone());
+        window.on_mouse_event(move |e: &ScrollEvent, phase, window, cx| {
+            if phase != DispatchPhase::Bubble || !hitbox.should_handle_scroll(window) {
+                return;
+            }
+            let (dx, dy) = scroll_px(&e.delta);
+            let _ = view.update(cx, |this, cx| {
+                let fx = this
+                    .state
+                    .scroll(rel(e.position), dx, dy, mods(&e.modifiers));
+                this.apply_effects(fx, cx);
+            });
+        });
+    }
+    {
+        let (view, hitbox) = (view.clone(), hitbox.clone());
+        window.on_mouse_event(move |e: &PinchEvent, phase, window, cx| {
+            if phase != DispatchPhase::Bubble || !hitbox.is_hovered(window) {
+                return;
+            }
+            let _ = view.update(cx, |this, cx| {
+                let fx = this.state.pinch(rel(e.position), e.delta);
+                this.apply_effects(fx, cx);
+            });
+        });
+    }
+}
+
+// ---- frame-time log (XVIEW_FRAME_LOG=1) ----
+
+/// CPU time spent building the frame (prepaint) and emitting paint
+/// primitives, logged every `FRAME_LOG_EVERY` frames.
+#[derive(Default)]
+struct FrameStats {
+    frames: u32,
+    build_sum: Duration,
+    paint_sum: Duration,
+    total_max: Duration,
+    prims: usize,
+}
+
+impl FrameStats {
+    fn record(&mut self, build: Duration, paint: Duration, prims: usize) {
+        self.frames += 1;
+        self.build_sum += build;
+        self.paint_sum += paint;
+        self.total_max = self.total_max.max(build + paint);
+        self.prims = prims;
+        if self.frames == FRAME_LOG_EVERY {
+            let ms = |d: Duration| d.as_secs_f64() * 1000.0 / f64::from(self.frames);
+            eprintln!(
+                "xview frame-time: build {:.3} ms + paint {:.3} ms = {:.3} ms avg, max {:.3} ms over {} frames ({} prims)",
+                ms(self.build_sum),
+                ms(self.paint_sum),
+                ms(self.build_sum + self.paint_sum),
+                self.total_max.as_secs_f64() * 1000.0,
+                self.frames,
+                self.prims,
+            );
+            *self = FrameStats::default();
+        }
+    }
+}
