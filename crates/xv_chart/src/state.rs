@@ -88,6 +88,7 @@ pub struct ChartState {
     drag: Drag,
     /// First anchor of a click-click placement in progress.
     pending: Option<Anchor>,
+    last_mods: Mods,
 }
 
 fn contains(r: &RectF, p: (f32, f32)) -> bool {
@@ -115,6 +116,7 @@ impl ChartState {
             tz: TzOffset::default(),
             drag: Drag::None,
             pending: None,
+            last_mods: Mods::default(),
         }
     }
 
@@ -130,7 +132,7 @@ impl ChartState {
     pub fn set_series(&mut self, s: Series) {
         self.series = s;
         self.loading_older = false;
-        self.cancel_drag();
+        self.abort_drag();
         self.pending = None;
         let spacing = self.vp.bar_spacing;
         self.vp = Viewport::new(self.layout.plot.w, self.layout.plot.h);
@@ -147,8 +149,14 @@ impl ChartState {
     }
 
     pub fn mouse_down(&mut self, p: (f32, f32), m: Mods, click_count: usize) -> Vec<ChartEffect> {
-        self.cancel_drag();
-        let mut fx = Vec::new();
+        self.last_mods = m;
+        // A drag still active here lost its mouse-up: finish it first.
+        // A stale placement press is treated as a plain click.
+        let at = match self.drag {
+            Drag::Place { start, .. } => start,
+            _ => p,
+        };
+        let mut fx = self.finish_drag(at, m);
         if contains(&self.layout.plot, p) {
             if self.tool != Tool::Cursor {
                 self.press_with_tool(p, m, &mut fx);
@@ -188,9 +196,10 @@ impl ChartState {
 
     pub fn mouse_move(&mut self, p: (f32, f32), m: Mods, pressed: bool) -> Vec<ChartEffect> {
         self.crosshair = contains(&self.layout.plot, p).then_some(p);
+        self.last_mods = m;
         if !pressed {
-            self.cancel_drag();
-            return Vec::new();
+            // Released outside the window: finish exactly like mouse_up.
+            return self.finish_drag(p, m);
         }
         match self.drag.clone() {
             Drag::None | Drag::Place { .. } => return Vec::new(),
@@ -258,6 +267,11 @@ impl ChartState {
     }
 
     pub fn mouse_up(&mut self, p: (f32, f32), m: Mods) -> Vec<ChartEffect> {
+        self.last_mods = m;
+        self.finish_drag(p, m)
+    }
+
+    fn finish_drag(&mut self, p: (f32, f32), m: Mods) -> Vec<ChartEffect> {
         let drag = std::mem::replace(&mut self.drag, Drag::None);
         let mut fx = Vec::new();
         match drag {
@@ -362,13 +376,41 @@ impl ChartState {
         self.vp.autofit(self.series.candles());
     }
 
+    /// Temporary drawing of the current tool from the pending first anchor to
+    /// the anchor under the crosshair. Never added to the set.
+    fn placement_preview(&self) -> Option<Drawing> {
+        let first = match (&self.drag, self.pending) {
+            (Drag::Place { first, .. }, _) => *first,
+            (_, Some(a)) => a,
+            _ => return None,
+        };
+        let c = self.crosshair?;
+        match place_click(self.tool, Some(first), self.anchor_at(c, self.last_mods))? {
+            PlaceResult::Done(kind) => Some(Drawing {
+                id: DrawingId(u64::MAX),
+                kind,
+                style: Style::default(),
+            }),
+            PlaceResult::Pending(_) => None,
+        }
+    }
+
     pub fn frame(&self, colors: &ChartColors, source_name: &str) -> Frame {
+        let mut all;
+        let drawings = match self.placement_preview() {
+            Some(d) => {
+                all = self.drawings.all().to_vec();
+                all.push(d);
+                &all[..]
+            }
+            None => self.drawings.all(),
+        };
         build_frame(&FrameInput {
             series: &self.series,
             vp: &self.vp,
             layout: &self.layout,
             crosshair: self.crosshair,
-            drawings: self.drawings.all(),
+            drawings,
             drawings_hidden: self.drawings_hidden,
             selected: self.selected,
             colors,
@@ -415,8 +457,11 @@ impl ChartState {
 
     pub fn set_tool(&mut self, t: Tool) {
         self.tool = t;
+        if t != Tool::Cursor {
+            self.drawings_hidden = false;
+        }
         self.pending = None;
-        self.cancel_drag();
+        self.abort_drag();
     }
 
     /// True while a click-click placement has its first point set.
@@ -437,7 +482,7 @@ impl ChartState {
     }
 
     pub fn clear_drawings(&mut self) -> Vec<ChartEffect> {
-        self.cancel_drag();
+        self.abort_drag();
         self.pending = None;
         let mut fx = Vec::new();
         if !self.drawings.all().is_empty() {
@@ -455,21 +500,28 @@ impl ChartState {
                 if let Some(id) = self.selected
                     && !self.drawings_locked
                 {
-                    self.cancel_drag();
+                    self.abort_drag();
                     self.drawings.remove(id);
                     fx.push(ChartEffect::DrawingsChanged);
                     self.select(None, &mut fx);
                 }
             }
             ChartKey::Escape => {
-                if self.pending.take().is_some() {
-                    self.cancel_drag();
-                } else {
+                let dragging = !matches!(self.drag, Drag::None | Drag::Pan { .. });
+                if dragging {
+                    // Moved drawings are restored; a placement press is dropped.
+                    self.abort_drag();
+                } else if self.pending.take().is_some() {
+                    // Pending placement cancelled.
+                } else if self.selected.is_some() {
                     self.select(None, &mut fx);
+                } else if self.tool != Tool::Cursor {
+                    self.tool = Tool::Cursor;
+                    fx.push(ChartEffect::ToolFinished);
                 }
             }
             ChartKey::Undo | ChartKey::Redo => {
-                self.cancel_drag();
+                self.abort_drag();
                 self.pending = None;
                 let changed = if k == ChartKey::Undo {
                     self.drawings.undo()
@@ -527,11 +579,36 @@ impl ChartState {
         })
     }
 
-    fn cancel_drag(&mut self) {
-        if matches!(self.drag, Drag::Body { .. } | Drag::Handle { .. }) {
-            self.drawings.end_gesture();
+    /// Abandons the active drag: moved drawings go back to their drag-start
+    /// state and no undo step remains.
+    fn abort_drag(&mut self) {
+        match std::mem::replace(&mut self.drag, Drag::None) {
+            Drag::Body { snapshot, .. } | Drag::Handle { snapshot, .. } => {
+                self.drawings.replace(snapshot);
+                self.drawings.end_gesture();
+            }
+            _ => {}
         }
-        self.drag = Drag::None;
+    }
+
+    pub fn set_locked(&mut self, locked: bool) -> Vec<ChartEffect> {
+        self.abort_drag();
+        self.drawings_locked = locked;
+        let mut fx = Vec::new();
+        if locked {
+            self.select(None, &mut fx);
+        }
+        fx
+    }
+
+    pub fn set_hidden(&mut self, hidden: bool) -> Vec<ChartEffect> {
+        self.abort_drag();
+        self.drawings_hidden = hidden;
+        let mut fx = Vec::new();
+        if hidden {
+            self.select(None, &mut fx);
+        }
+        fx
     }
 
     fn select(&mut self, id: Option<DrawingId>, fx: &mut Vec<ChartEffect>) {
@@ -837,7 +914,7 @@ mod tests {
 
     // ---- Task 12: drawing gestures ----
 
-    use crate::ChartProjector;
+    use crate::{ChartProjector, Prim};
     use xv_core::{TzOffset, resample};
     use xv_drawings::{Anchor, DrawingId, DrawingKind, Projector, Style};
 
@@ -981,11 +1058,10 @@ mod tests {
         for i in (0..10).rev() {
             s.mouse_move((300.0 + i as f32 * 10.0, 125.0), no(), true);
         }
-        let fx = s.mouse_up((300.0, 125.0), no());
+        s.mouse_up((300.0, 125.0), no());
         let (a, b) = ends(&s, id);
         assert!((a.time_ms - a0.time_ms).abs() <= 1 && (b.time_ms - b0.time_ms).abs() <= 1);
         assert!((a.price - a0.price).abs() < 1e-9 && (b.price - b0.price).abs() < 1e-9);
-        let _ = fx;
     }
 
     #[test]
@@ -1135,7 +1211,7 @@ mod tests {
     fn selected_bounds_cover_handles_and_clamp() {
         let mut s = state(500, false);
         assert_eq!(s.selected_screen_bounds(), None);
-        let (_, a, b) = (0, trend(&mut s).1, trend(&mut s).2);
+        let (_, a, b) = trend(&mut s);
         click(&mut s, (300.0, 125.0), no());
         let r = s.selected_screen_bounds().unwrap();
         let (pa, pb) = (scr(&s, a), scr(&s, b));
@@ -1219,6 +1295,130 @@ mod tests {
         assert_eq!(s.series.len(), 510);
         assert!(s.vp.is_following(510));
         assert_eq!(s.vp.right_index, 509.0 + RIGHT_MARGIN_BARS);
+    }
+
+    fn drag_body(s: &mut ChartState) -> DrawingId {
+        let (id, _, _) = trend(s);
+        s.mouse_down((300.0, 125.0), no(), 1);
+        for i in 1..=5 {
+            s.mouse_move((300.0 + i as f32 * 10.0, 125.0), no(), true);
+        }
+        id
+    }
+
+    #[test]
+    fn release_outside_window_commits_drag() {
+        let mut s = state(500, false);
+        let (_, a0, _) = trend(&mut s);
+        let id = drag_body(&mut s);
+        let fx = s.mouse_move((350.0, 125.0), no(), false);
+        assert!(fx.contains(&ChartEffect::DrawingsChanged));
+        assert_ne!(ends(&s, id).0, a0);
+        let moved = ends(&s, id).0;
+        assert!(s.mouse_move((360.0, 125.0), no(), false).is_empty());
+        assert_eq!(ends(&s, id).0, moved);
+        s.key(ChartKey::Undo);
+        assert_eq!(ends(&s, id).0, a0);
+        assert!(
+            !s.key(ChartKey::Undo)
+                .contains(&ChartEffect::DrawingsChanged)
+        );
+    }
+
+    #[test]
+    fn set_series_mid_drag_restores_snapshot() {
+        let mut s = state(500, false);
+        let (_, a0, _) = trend(&mut s);
+        let id = drag_body(&mut s);
+        assert_ne!(ends(&s, id).0, a0);
+        let ser = series(1000..1500, false);
+        s.set_series(ser);
+        assert_eq!(ends(&s, id).0, a0);
+        assert!(
+            !s.key(ChartKey::Undo)
+                .contains(&ChartEffect::DrawingsChanged)
+        );
+    }
+
+    #[test]
+    fn stale_mouse_down_commits_previous_drag() {
+        let mut s = state(500, false);
+        let (_, a0, _) = trend(&mut s);
+        let id = drag_body(&mut s);
+        let fx = s.mouse_down((100.0, 350.0), no(), 1);
+        assert!(fx.contains(&ChartEffect::DrawingsChanged));
+        assert_ne!(ends(&s, id).0, a0);
+        s.mouse_up((100.0, 350.0), no());
+        s.key(ChartKey::Undo);
+        assert_eq!(ends(&s, id).0, a0);
+    }
+
+    #[test]
+    fn escape_aborts_in_progress_drags() {
+        let mut s = state(500, false);
+        let (_, a0, _) = trend(&mut s);
+        let id = drag_body(&mut s);
+        s.key(ChartKey::Escape);
+        assert_eq!(ends(&s, id).0, a0);
+        assert!(s.mouse_up((350.0, 125.0), no()).is_empty());
+        assert!(
+            !s.key(ChartKey::Undo)
+                .contains(&ChartEffect::DrawingsChanged)
+        );
+        // Placement drag.
+        let mut s = state(500, false);
+        s.set_tool(Tool::Rectangle);
+        s.mouse_down((200.0, 150.0), no(), 1);
+        s.mouse_move((300.0, 200.0), no(), true);
+        s.key(ChartKey::Escape);
+        let fx = s.mouse_up((300.0, 200.0), no());
+        assert!(fx.is_empty() && s.drawings.all().is_empty());
+        assert!(!s.placement_pending());
+    }
+
+    #[test]
+    fn escape_with_tool_and_nothing_else_returns_to_cursor() {
+        let mut s = state(500, false);
+        s.set_tool(Tool::Ray);
+        let fx = s.key(ChartKey::Escape);
+        assert_eq!(s.tool, Tool::Cursor);
+        assert_eq!(fx, vec![ChartEffect::ToolFinished]);
+    }
+
+    #[test]
+    fn set_tool_unhides_and_lock_hide_deselect() {
+        let mut s = state(500, false);
+        trend(&mut s);
+        click(&mut s, (300.0, 125.0), no());
+        assert!(s.selected.is_some());
+        assert_eq!(s.set_locked(true), vec![ChartEffect::SelectionChanged]);
+        assert!(s.drawings_locked && s.selected.is_none());
+        s.set_locked(false);
+        click(&mut s, (300.0, 125.0), no());
+        assert_eq!(s.set_hidden(true), vec![ChartEffect::SelectionChanged]);
+        assert!(s.drawings_hidden && s.selected.is_none());
+        s.set_tool(Tool::TrendLine);
+        assert!(!s.drawings_hidden);
+    }
+
+    #[test]
+    fn pending_placement_renders_preview() {
+        let lines = |f: &Frame| {
+            f.plot
+                .iter()
+                .filter(|p| matches!(p, Prim::Line { .. }))
+                .count()
+        };
+        let mut s = state(500, false);
+        s.set_tool(Tool::TrendLine);
+        s.mouse_move((300.0, 100.0), no(), false);
+        let base = lines(&s.frame(&ChartColors::dark(), "t"));
+        click(&mut s, (200.0, 150.0), no());
+        assert!(s.placement_pending());
+        s.mouse_move((300.0, 100.0), no(), false);
+        let f = s.frame(&ChartColors::dark(), "t");
+        assert_eq!(lines(&f), base + 1);
+        assert!(s.drawings.all().is_empty());
     }
 
     #[test]
