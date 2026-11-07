@@ -5852,6 +5852,14 @@ version = "0.1.0"
 [[package]]
 name = "xv_source_csv"
 version = "0.1.0"
+dependencies = [
+ "chrono",
+ "futures",
+ "tempfile",
+ "thiserror",
+ "xv_core",
+ "xv_data",
+]
 
 [[package]]
 name = "xv_store"
