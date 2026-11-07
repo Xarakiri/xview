@@ -1,0 +1,185 @@
+use crate::atomic::{move_aside, write_atomic};
+use std::path::{Path, PathBuf};
+use xv_core::SymbolKey;
+use xv_drawings::{Drawing, DrawingsFile, FILE_VERSION, from_json, to_json};
+
+#[derive(Debug)]
+pub enum LoadedDrawings {
+    Ok(Vec<Drawing>),
+    Missing,
+    /// The file was unreadable or invalid and was moved here, untouched.
+    Corrupt {
+        moved_to: PathBuf,
+    },
+}
+
+pub(crate) fn fnv1a64(s: &str) -> u64 {
+    let mut h: u64 = 0xcbf29ce484222325;
+    for b in s.bytes() {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    h
+}
+
+fn sanitize(s: &str) -> String {
+    s.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .take(64)
+        .collect()
+}
+
+/// `dir/drawings/<source>/<sanitized id>-<fnv1a64 hex>.json`
+pub fn drawings_path(dir: &Path, key: &SymbolKey) -> PathBuf {
+    let mut source = sanitize(&key.source.0);
+    if source.is_empty() || source.chars().all(|c| c == '.') {
+        source = "_".into();
+    }
+    dir.join("drawings").join(source).join(format!(
+        "{}-{:016x}.json",
+        sanitize(&key.id),
+        fnv1a64(&key.id)
+    ))
+}
+
+pub fn load_drawings(dir: &Path, key: &SymbolKey) -> LoadedDrawings {
+    let path = drawings_path(dir, key);
+    match std::fs::read(&path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => LoadedDrawings::Missing,
+        Err(_) => aside(&path),
+        Ok(bytes) => match String::from_utf8(bytes)
+            .ok()
+            .and_then(|s| from_json(&s).ok())
+        {
+            Some(f) => LoadedDrawings::Ok(f.drawings),
+            None => aside(&path),
+        },
+    }
+}
+
+fn aside(path: &Path) -> LoadedDrawings {
+    match move_aside(path) {
+        Ok(moved_to) => LoadedDrawings::Corrupt { moved_to },
+        // Could not move it; report the original so the caller never saves over silently.
+        Err(_) => LoadedDrawings::Corrupt {
+            moved_to: path.to_path_buf(),
+        },
+    }
+}
+
+pub fn save_drawings(dir: &Path, key: &SymbolKey, ds: &[Drawing]) -> std::io::Result<()> {
+    let file = DrawingsFile {
+        version: FILE_VERSION,
+        symbol: format!("{}:{}", key.source.0, key.id),
+        drawings: ds.to_vec(),
+    };
+    write_atomic(&drawings_path(dir, key), to_json(&file).as_bytes())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use xv_core::{SourceId, SymbolKey};
+    use xv_drawings::{Anchor, Drawing, DrawingId, DrawingKind, Style};
+
+    fn key(id: &str) -> SymbolKey {
+        SymbolKey {
+            source: SourceId("csv".into()),
+            id: id.into(),
+        }
+    }
+
+    fn drawing(n: u64) -> Drawing {
+        Drawing {
+            id: DrawingId(n),
+            kind: DrawingKind::Ray {
+                a: Anchor {
+                    time_ms: 10,
+                    price: 1.5,
+                },
+                b: Anchor {
+                    time_ms: 20,
+                    price: 2.5,
+                },
+            },
+            style: Style::default(),
+        }
+    }
+
+    #[test]
+    fn drawings_round_trip() {
+        let t = tempfile::TempDir::new().unwrap();
+        let k = key("/a/b.csv");
+        assert!(matches!(
+            load_drawings(t.path(), &k),
+            LoadedDrawings::Missing
+        ));
+        let ds = vec![drawing(1), drawing(2)];
+        save_drawings(t.path(), &k, &ds).unwrap();
+        match load_drawings(t.path(), &k) {
+            LoadedDrawings::Ok(back) => assert_eq!(back, ds),
+            _ => panic!("expected Ok"),
+        }
+        save_drawings(t.path(), &k, &[]).unwrap();
+        assert!(matches!(load_drawings(t.path(), &k), LoadedDrawings::Ok(v) if v.is_empty()));
+    }
+
+    #[test]
+    fn corrupt_drawings_file_is_moved_aside() {
+        let t = tempfile::TempDir::new().unwrap();
+        let k = key("x");
+        let p = drawings_path(t.path(), &k);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(&p, "{garbage").unwrap();
+        let LoadedDrawings::Corrupt { moved_to } = load_drawings(t.path(), &k) else {
+            panic!("expected Corrupt")
+        };
+        assert_eq!(std::fs::read_to_string(&moved_to).unwrap(), "{garbage");
+        assert!(!p.exists());
+    }
+
+    #[test]
+    fn unsupported_version_is_moved_aside_and_backups_never_overwritten() {
+        let t = tempfile::TempDir::new().unwrap();
+        let k = key("x");
+        let p = drawings_path(t.path(), &k);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        let mut seen = std::collections::HashSet::new();
+        for i in 0..3 {
+            std::fs::write(&p, format!(r#"{{"version":9,"n":{i}}}"#)).unwrap();
+            let LoadedDrawings::Corrupt { moved_to } = load_drawings(t.path(), &k) else {
+                panic!("expected Corrupt")
+            };
+            assert!(seen.insert(moved_to.clone()));
+            assert!(
+                std::fs::read_to_string(&moved_to)
+                    .unwrap()
+                    .contains(&format!("\"n\":{i}"))
+            );
+        }
+    }
+
+    #[test]
+    fn paths_are_distinct_for_similar_ids() {
+        let t = std::path::Path::new("/d");
+        assert_ne!(
+            drawings_path(t, &key("/a/b.csv")),
+            drawings_path(t, &key("/a_b.csv"))
+        );
+        let long = "z".repeat(200);
+        let name = drawings_path(t, &key(&long));
+        assert!(name.file_name().unwrap().len() < 64 + 1 + 16 + 5 + 1);
+    }
+
+    #[test]
+    fn fnv_known_vector() {
+        assert_eq!(fnv1a64(""), 0xcbf29ce484222325);
+        assert_eq!(fnv1a64("a"), 0xaf63dc4c8601ec8c);
+    }
+}

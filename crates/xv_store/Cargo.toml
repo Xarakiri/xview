@@ -6,3 +6,11 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+xv_core = { path = "../xv_core" }
+xv_drawings = { path = "../xv_drawings" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+dirs = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
