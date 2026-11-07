@@ -2,7 +2,9 @@ use std::time::Duration;
 
 use futures::stream::{BoxStream, StreamExt};
 use tokio::sync::mpsc;
-use tokio_tungstenite::tungstenite::Message;
+use tokio::time::error::Elapsed;
+use tokio_tungstenite::tungstenite::{Error as WsError, Message};
+use xv_core::Candle;
 use xv_data::CandleUpdate;
 
 use crate::WS_HOSTS;
@@ -29,7 +31,41 @@ async fn connect(path: &str) -> Option<Ws> {
     None
 }
 
+/// A healthy Binance stream carries pings roughly every 20 s, so silence this long means the
+/// connection is dead (sleep/wake, Wi-Fi switch) even though no FIN/RST arrived.
+pub const READ_TIMEOUT: Duration = Duration::from_secs(60);
+
+type ReadResult = Result<Option<Result<Message, WsError>>, Elapsed>;
+
+#[derive(Debug, PartialEq)]
+enum ReadOutcome {
+    Kline(Candle),
+    Ignore,
+    Disconnect,
+}
+
+/// Decides what a (timed) websocket read means. Timeout, close, error and stream end are all
+/// treated as a disconnect.
+fn classify_read(r: ReadResult) -> ReadOutcome {
+    match r {
+        Ok(Some(Ok(Message::Text(text)))) => match parse_ws_kline(&text) {
+            Ok(c) => ReadOutcome::Kline(c),
+            // Subscription acks and other non-kline payloads are ignored.
+            Err(_) => ReadOutcome::Ignore,
+        },
+        // Pings are answered by tungstenite while we keep reading.
+        Ok(Some(Ok(Message::Close(_)))) | Ok(Some(Err(_))) | Ok(None) | Err(_) => ReadOutcome::Disconnect,
+        Ok(Some(Ok(_))) => ReadOutcome::Ignore,
+    }
+}
+
 /// Runs until the consumer drops the receiver.
+///
+/// Backpressure: candle updates use `try_send` and are dropped when the channel is full, so a
+/// slow consumer can never stall the read loop (and with it pong replies); the next kline
+/// supersedes a dropped one. Control events (Disconnected/Reconnected) are rare and must not be
+/// lost, so they use `send().await`; that only waits when the channel is full and fails
+/// immediately once the receiver is gone.
 async fn run(path: String, tx: mpsc::Sender<CandleUpdate>) {
     let mut attempt: u32 = 0;
     let mut announced_down = false;
@@ -42,23 +78,20 @@ async fn run(path: String, tx: mpsc::Sender<CandleUpdate>) {
                 }
             }
             loop {
-                let msg = tokio::select! {
+                let read = tokio::select! {
                     _ = tx.closed() => return,
-                    m = ws.next() => m,
+                    r = tokio::time::timeout(READ_TIMEOUT, ws.next()) => r,
                 };
-                match msg {
-                    Some(Ok(Message::Text(text))) => {
-                        // Subscription acks and other non-kline payloads are ignored.
-                        if let Ok(c) = parse_ws_kline(&text) {
-                            attempt = 0;
-                            if tx.send(CandleUpdate::Candle(c)).await.is_err() {
-                                return;
-                            }
+                match classify_read(read) {
+                    ReadOutcome::Kline(c) => {
+                        attempt = 0;
+                        match tx.try_send(CandleUpdate::Candle(c)) {
+                            Ok(()) | Err(mpsc::error::TrySendError::Full(_)) => {}
+                            Err(mpsc::error::TrySendError::Closed(_)) => return,
                         }
                     }
-                    // Pings are answered by tungstenite while we keep reading.
-                    Some(Ok(Message::Close(_))) | Some(Err(_)) | None => break,
-                    Some(Ok(_)) => {}
+                    ReadOutcome::Ignore => {}
+                    ReadOutcome::Disconnect => break,
                 }
             }
             let _ = ws.close(None).await;
@@ -99,5 +132,27 @@ mod tests {
         let v: Vec<_> = (0..7).map(backoff_secs).collect();
         assert_eq!(v, [1, 2, 4, 8, 16, 30, 30]);
         assert_eq!(backoff_secs(1000), 30);
+    }
+
+    const WS: &str = include_str!("../tests/fixtures/ws_kline.json");
+
+    async fn elapsed() -> Elapsed {
+        tokio::time::timeout(Duration::from_millis(1), std::future::pending::<()>()).await.unwrap_err()
+    }
+
+    #[tokio::test]
+    async fn timeout_and_stream_end_are_disconnects() {
+        assert_eq!(classify_read(Err(elapsed().await)), ReadOutcome::Disconnect);
+        assert_eq!(classify_read(Ok(None)), ReadOutcome::Disconnect);
+        assert_eq!(classify_read(Ok(Some(Ok(Message::Close(None))))), ReadOutcome::Disconnect);
+        assert_eq!(classify_read(Ok(Some(Err(WsError::ConnectionClosed)))), ReadOutcome::Disconnect);
+    }
+
+    #[test]
+    fn kline_and_noise_classification() {
+        let expected = parse_ws_kline(WS).unwrap();
+        assert_eq!(classify_read(Ok(Some(Ok(Message::Text(WS.into()))))), ReadOutcome::Kline(expected));
+        assert_eq!(classify_read(Ok(Some(Ok(Message::Ping(vec![1]))))), ReadOutcome::Ignore);
+        assert_eq!(classify_read(Ok(Some(Ok(Message::Text("{\"result\":null,\"id\":1}".into()))))), ReadOutcome::Ignore);
     }
 }
