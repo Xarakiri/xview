@@ -79,14 +79,28 @@ impl Series {
         }
     }
 
-    /// Inserts or overwrites candles by timestamp, keeping order.
-    pub fn merge_range(&mut self, cs: Vec<Candle>) {
+    /// Whether merging `cs` (newer candles, e.g. a backfill page) leaves no
+    /// hole after the current last candle: the page reaches back to it. True
+    /// for an empty series or page.
+    pub fn reaches_last(&self, cs: &[Candle]) -> bool {
+        match (self.candles.last(), cs.iter().map(|c| c.open_time_ms).min()) {
+            (Some(last), Some(first)) => first <= last.open_time_ms,
+            _ => true,
+        }
+    }
+
+    /// Inserts or overwrites candles by timestamp, keeping order. Returns
+    /// `reaches_last` as it was before the merge: false means the page did
+    /// not overlap the old last candle and bars between them are missing.
+    pub fn merge_range(&mut self, cs: Vec<Candle>) -> bool {
+        let overlapped = self.reaches_last(&cs);
         for c in normalize(cs) {
             match self.candles.binary_search_by_key(&c.open_time_ms, |x| x.open_time_ms) {
                 Ok(i) => self.candles[i] = c,
                 Err(i) => self.candles.insert(i, c),
             }
         }
+        overlapped
     }
 }
 
@@ -150,11 +164,27 @@ mod tests {
     #[test]
     fn merge_range_fills_gap_and_overwrites_overlap() {
         let mut s = series(&[0, 1, 2, 6, 7]);
-        s.merge_range(vec![c(2, 22.0), c(3, 3.0), c(4, 4.0), c(5, 5.0)]);
+        assert!(s.merge_range(vec![c(2, 22.0), c(3, 3.0), c(4, 4.0), c(5, 5.0)]));
         let got: Vec<_> = s.candles().iter().map(|x| (x.open_time_ms / MIN, x.close)).collect();
         assert_eq!(
             got,
             [(0, 0.0), (1, 1.0), (2, 22.0), (3, 3.0), (4, 4.0), (5, 5.0), (6, 6.0), (7, 7.0)]
         );
+    }
+
+    #[test]
+    fn merge_range_detects_a_page_that_misses_the_last_candle() {
+        let mut s = series(&[0, 1, 2]);
+        // Overlaps the last candle (2): no hole.
+        assert!(s.reaches_last(&[c(2, 2.0), c(3, 3.0)]));
+        // Starts one bar after it: bar 2's final close is not in the page,
+        // so it still counts as not reaching.
+        assert!(!s.reaches_last(&[c(3, 3.0)]));
+        // Starts later: bars 3..9 are missing. Still merged, but reported.
+        assert!(!s.merge_range(vec![c(10, 10.0), c(11, 11.0)]));
+        let got: Vec<_> = s.candles().iter().map(|x| x.open_time_ms / MIN).collect();
+        assert_eq!(got, [0, 1, 2, 10, 11]);
+        assert!(s.reaches_last(&[]));
+        assert!(Series::new(sym(), Timeframe::M1, vec![], false).reaches_last(&[c(5, 5.0)]));
     }
 }

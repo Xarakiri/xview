@@ -49,6 +49,11 @@ impl SeriesCache {
         self.map.retain(|(k, _), _| k != key);
     }
 
+    /// Drops one series.
+    pub fn remove(&mut self, key: &SymbolKey, tf: Timeframe) -> Option<Series> {
+        self.map.remove(&(key.clone(), tf)).map(|(s, _)| s)
+    }
+
     /// Inserts (or replaces) a series, evicting the least recently used one when full.
     pub fn insert(&mut self, series: Series) {
         let key = (series.symbol.key(), series.timeframe);
@@ -108,6 +113,18 @@ mod tests {
         c.remove_symbol(&key);
         assert_eq!(c.len(), 1);
         assert!(c.get(&key, Timeframe::H1).is_none());
+    }
+
+    #[test]
+    fn remove_drops_one_timeframe() {
+        let mut c = SeriesCache::new();
+        let s = series(0);
+        let key = s.symbol.key();
+        c.insert(s.clone());
+        c.insert(Series::new(s.symbol.clone(), Timeframe::H1, vec![], false));
+        assert!(c.remove(&key, Timeframe::M1).is_some());
+        assert!(c.remove(&key, Timeframe::M1).is_none());
+        assert!(c.get(&key, Timeframe::H1).is_some());
     }
 
     #[test]

@@ -29,7 +29,7 @@ use crate::bottom_bar::BottomBar;
 use crate::chart_view::{ChartView, ChartViewEvent};
 use crate::demo;
 use crate::left_toolbar::LeftToolbar;
-use crate::loader::Loader;
+use crate::loader::{BackfillOutcome, Loader};
 use crate::persistence::Persistence;
 use crate::symbol_search::{SearchEvent, SymbolSearch};
 use crate::side_panel::SidePanel;
@@ -120,8 +120,15 @@ pub struct Workspace {
     pub(crate) loader: Loader,
     pub(crate) persistence: Persistence,
     theme: AppTheme,
+    /// The series on screen, or being opened. After a failed open this is
+    /// put back to what the chart shows.
     symbol: Symbol,
     timeframe: Timeframe,
+    /// What the load banner's Retry opens: the failed request.
+    retry_target: Option<(Symbol, Timeframe)>,
+    /// A symbol restored from settings whose metadata isn't resolved yet;
+    /// its tick size is guessed from the first page until then.
+    unresolved: Option<SymbolKey>,
     /// Clock and chart times in UTC instead of the local offset.
     use_utc: bool,
     /// Pending banners; the newest is shown, dismissing reveals the previous.
@@ -431,6 +438,8 @@ impl Workspace {
             theme,
             symbol: start.symbol.clone(),
             timeframe: start.timeframe,
+            retry_target: None,
+            unresolved: start.resolve.then(|| start.symbol.key()),
             use_utc,
             banners: Vec::new(),
             nav: LoadGuard::new(),
@@ -481,6 +490,7 @@ impl Workspace {
         self.nav.next();
         self.symbol = symbol.clone();
         self.timeframe = tf;
+        self.retry_target = None;
         let supported = self.loader.supported_timeframes(&symbol);
         self.top_bar.update(cx, |bar, cx| {
             bar.set_symbol_timeframe(&symbol, tf, cx);
@@ -492,7 +502,7 @@ impl Workspace {
             cx.notify();
         }
         if let Err(e) = self.loader.open(symbol, tf, cx) {
-            self.show_load_error(&e, cx);
+            self.open_failed(&e, cx);
         }
         // A cache hit is already on screen.
         self.sync_drawings(cx);
@@ -500,7 +510,10 @@ impl Workspace {
     }
 
     fn retry(&mut self, cx: &mut Context<Self>) {
-        let (symbol, tf) = (self.symbol.clone(), self.timeframe);
+        let (symbol, tf) = self
+            .retry_target
+            .take()
+            .unwrap_or_else(|| (self.symbol.clone(), self.timeframe));
         self.open_symbol(symbol, tf, cx);
     }
 
@@ -515,11 +528,55 @@ impl Workspace {
         }
         match result {
             Ok(page) => {
+                let empty = page.candles.is_empty();
+                let tick = (self.unresolved.as_ref() == Some(&self.symbol.key()) && !empty)
+                    .then(|| xv_core::infer_tick_size(&page.candles));
                 if self.loader.land(token, page, cx) {
                     self.sync_drawings(cx);
+                    if let Some(tick) = tick {
+                        // Until (or unless) the metadata lookup answers.
+                        let symbol = Symbol {
+                            tick_size: tick,
+                            ..self.symbol.clone()
+                        };
+                        self.apply_symbol_metadata(symbol, cx);
+                    }
+                    if empty {
+                        let text = format!(
+                            "No data for {} at {}",
+                            self.symbol.display,
+                            self.timeframe.label()
+                        );
+                        self.show_banner(text, BannerKind::Info, cx);
+                    }
                 }
             }
-            Err(e) => self.show_load_error(&e, cx),
+            Err(e) => {
+                self.loader.open_failed(token);
+                self.open_failed(&e, cx);
+            }
+        }
+    }
+
+    /// The open of `self.symbol`/`self.timeframe` failed: shows the error
+    /// (Retry opens that request again) and puts the top bar back to the
+    /// series the chart still shows.
+    fn open_failed(&mut self, e: &DataError, cx: &mut Context<Self>) {
+        self.show_load_error(e, cx);
+        self.retry_target = Some((self.symbol.clone(), self.timeframe));
+        let (shown, tf) = {
+            let s = &self.chart.read(cx).state.series;
+            (s.symbol.clone(), s.timeframe)
+        };
+        if shown.key() != self.symbol.key() || tf != self.timeframe {
+            self.symbol = shown.clone();
+            self.timeframe = tf;
+            let supported = self.loader.supported_timeframes(&shown);
+            self.top_bar.update(cx, |bar, cx| {
+                bar.set_symbol_timeframe(&shown, tf, cx);
+                bar.set_supported(supported, cx);
+            });
+            self.save_settings(cx);
         }
     }
 
@@ -545,14 +602,19 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         match result {
-            Ok(page) => {
-                self.loader.merge_backfill(token, page, cx);
+            Ok(page) => match self.loader.on_backfill_page(token, page, cx) {
+                BackfillOutcome::Handled => {}
+                BackfillOutcome::Reopen(symbol, tf) => {
+                    // Too many bars missed to page through: load afresh.
+                    self.open_symbol(symbol, tf, cx);
+                }
+            },
+            Err(e) => {
+                if self.loader.backfill_failed(token) {
+                    let text = format!("Couldn't fill the gap after reconnecting: {e}");
+                    self.show_banner(text, BannerKind::Info, cx);
+                }
             }
-            Err(e) if self.loader.is_current(&token) => {
-                let text = format!("Couldn't fill the gap after reconnecting: {e}");
-                self.show_banner(text, BannerKind::Info, cx);
-            }
-            Err(_) => {}
         }
     }
 
@@ -578,15 +640,23 @@ impl Workspace {
                 return;
             };
             this.update(cx, |this, cx| {
-                if this.loader.update_symbol(&symbol, cx) {
-                    this.symbol = symbol.clone();
-                    let tf = this.timeframe;
-                    this.top_bar
-                        .update(cx, |bar, cx| bar.set_symbol_timeframe(&symbol, tf, cx));
+                if this.unresolved.as_ref() == Some(&key) {
+                    this.unresolved = None;
                 }
+                this.apply_symbol_metadata(symbol, cx);
             })
             .ok();
         }));
+    }
+
+    /// Replaces the metadata of the current symbol (same key).
+    fn apply_symbol_metadata(&mut self, symbol: Symbol, cx: &mut Context<Self>) {
+        if self.loader.update_symbol(&symbol, cx) && symbol.key() == self.symbol.key() {
+            self.symbol = symbol.clone();
+            let tf = self.timeframe;
+            self.top_bar
+                .update(cx, |bar, cx| bar.set_symbol_timeframe(&symbol, tf, cx));
+        }
     }
 
     fn select_timeframe(&mut self, tf: Timeframe, cx: &mut Context<Self>) {
