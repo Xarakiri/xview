@@ -5816,6 +5816,11 @@ version = "0.1.0"
 [[package]]
 name = "xv_core"
 version = "0.1.0"
+dependencies = [
+ "chrono",
+ "serde",
+ "serde_json",
+]
 
 [[package]]
 name = "xv_data"
