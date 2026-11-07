@@ -19,11 +19,11 @@ use gpui::{
 use gpui_tokio::Tokio;
 use xv_chart::ChartEffect;
 use xv_core::{Series, SourceId, Symbol, SymbolKey, Timeframe, TzOffset};
-use xv_data::{DataError, HistoryPage, LoadToken, SourceRegistry};
+use xv_data::{DataError, HistoryPage, LoadGuard, LoadToken, SourceRegistry};
 use xv_drawings::Tool;
 use xv_source_binance::BINANCE_SOURCE_ID;
 use xv_source_csv::{CSV_SOURCE_ID, CsvError, CsvLoadReport, CsvSource};
-use xv_store::{LoadedDrawings, Settings, ThemeMode, WindowRect, load_drawings};
+use xv_store::{LoadedDrawings, Settings, ThemeMode, WindowRect};
 
 use crate::bottom_bar::BottomBar;
 use crate::chart_view::{ChartView, ChartViewEvent};
@@ -126,6 +126,9 @@ pub struct Workspace {
     use_utc: bool,
     /// Pending banners; the newest is shown, dismissing reveals the previous.
     banners: Vec<Banner>,
+    /// Bumped by every symbol/timeframe switch and CSV open, so a CSV that
+    /// finishes parsing after the user moved on is dropped.
+    nav: LoadGuard,
     search: Option<(Entity<SymbolSearch>, Subscription)>,
     /// Symbol whose drawings the chart holds (that of the series on screen).
     drawings_key: Option<SymbolKey>,
@@ -430,6 +433,7 @@ impl Workspace {
             timeframe: start.timeframe,
             use_utc,
             banners: Vec::new(),
+            nav: LoadGuard::new(),
             search: None,
             drawings_key: None,
             window_rect: Some(window_rect(window)),
@@ -451,39 +455,11 @@ impl Workspace {
         if start.resolve {
             this.resolve_symbol(start.symbol.key(), cx);
         }
+        #[cfg(debug_assertions)]
         if let Some(script) = crate::debug_script::script() {
             crate::debug_script::start(script, window, cx);
         }
         this
-    }
-
-    // ---- debug script hooks (XVIEW_SCRIPT) ----
-
-    pub(crate) fn debug_select_timeframe(&mut self, tf: Timeframe, cx: &mut Context<Self>) {
-        self.select_timeframe(tf, cx);
-    }
-
-    pub(crate) fn debug_open_search(&mut self, q: String, window: &mut Window, cx: &mut Context<Self>) {
-        self.open_search(q, window, cx);
-    }
-
-    pub(crate) fn debug_open_csv(&mut self, path: &Path, cx: &mut Context<Self>) {
-        let result = self.loader.csv().load_file_report(path);
-        self.on_csv_loaded(path, result, cx);
-    }
-
-    pub(crate) fn debug_pick_search(&mut self, cx: &mut Context<Self>) {
-        if let Some((search, _)) = &self.search {
-            search.update(cx, |s, cx| s.pick_selected(cx));
-        }
-    }
-
-    pub(crate) fn debug_chart(
-        &mut self,
-        cx: &mut Context<Self>,
-        f: impl FnOnce(&mut ChartView, &mut Context<ChartView>),
-    ) {
-        self.chart.update(cx, f);
     }
 
     /// Runs `f` on the chart state and routes the returned effects.
@@ -502,6 +478,7 @@ impl Workspace {
 
     /// Switches the chart to `symbol` at `tf` through the loader.
     fn open_symbol(&mut self, symbol: Symbol, tf: Timeframe, cx: &mut Context<Self>) {
+        self.nav.next();
         self.symbol = symbol.clone();
         self.timeframe = tf;
         let supported = self.loader.supported_timeframes(&symbol);
@@ -637,6 +614,7 @@ impl Workspace {
             prompt: Some("Open".into()),
         });
         let csv = self.loader.csv().clone();
+        let token = self.nav.next();
         cx.spawn(async move |this, cx| {
             let Ok(Ok(Some(paths))) = paths.await else {
                 return;
@@ -648,7 +626,7 @@ impl Workspace {
             let result = cx
                 .background_spawn(async move { csv.load_file_report(&p) })
                 .await;
-            this.update(cx, |this, cx| this.on_csv_loaded(&path, result, cx))
+            this.update(cx, |this, cx| this.on_csv_loaded(token, &path, result, cx))
                 .ok();
         })
         .detach();
@@ -656,10 +634,15 @@ impl Workspace {
 
     fn on_csv_loaded(
         &mut self,
+        token: LoadToken,
         path: &Path,
         result: Result<CsvLoadReport, CsvError>,
         cx: &mut Context<Self>,
     ) {
+        if !self.nav.is_current(&token) {
+            // The user picked another symbol or file while this one parsed.
+            return;
+        }
         match result {
             Ok(report) => {
                 // A re-read file may have changed.
@@ -739,7 +722,7 @@ impl Workspace {
             return;
         }
         self.flush_drawings(cx);
-        let ds = match load_drawings(self.persistence.dir(), &key) {
+        let ds = match self.persistence.load_drawings(&key) {
             LoadedDrawings::Ok(ds) => ds,
             LoadedDrawings::Missing => Vec::new(),
             LoadedDrawings::Corrupt { path, moved } => {
@@ -765,6 +748,17 @@ impl Workspace {
 
     pub(crate) fn flush_drawings(&mut self, cx: &mut Context<Self>) {
         if let Err(errors) = self.persistence.flush() {
+            self.report_save_errors(errors, cx);
+        }
+    }
+
+    /// Shows failed drawings saves in the banner.
+    pub(crate) fn report_save_errors(
+        &mut self,
+        errors: Vec<crate::persistence::SaveError>,
+        cx: &mut Context<Self>,
+    ) {
+        if !errors.is_empty() {
             let parts: Vec<String> = errors
                 .iter()
                 .map(|e| {
@@ -948,6 +942,40 @@ impl Workspace {
                         .on_click(cx.listener(|this, _, _, cx| this.dismiss_banner(cx))),
                 ),
         )
+    }
+}
+
+/// Debug script hooks (`XVIEW_SCRIPT`); not compiled into release builds.
+#[cfg(debug_assertions)]
+impl Workspace {
+    // ---- debug script hooks (XVIEW_SCRIPT) ----
+
+    pub(crate) fn debug_select_timeframe(&mut self, tf: Timeframe, cx: &mut Context<Self>) {
+        self.select_timeframe(tf, cx);
+    }
+
+    pub(crate) fn debug_open_search(&mut self, q: String, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_search(q, window, cx);
+    }
+
+    pub(crate) fn debug_open_csv(&mut self, path: &Path, cx: &mut Context<Self>) {
+        let token = self.nav.next();
+        let result = self.loader.csv().load_file_report(path);
+        self.on_csv_loaded(token, path, result, cx);
+    }
+
+    pub(crate) fn debug_pick_search(&mut self, cx: &mut Context<Self>) {
+        if let Some((search, _)) = &self.search {
+            search.update(cx, |s, cx| s.pick_selected(cx));
+        }
+    }
+
+    pub(crate) fn debug_chart(
+        &mut self,
+        cx: &mut Context<Self>,
+        f: impl FnOnce(&mut ChartView, &mut Context<ChartView>),
+    ) {
+        self.chart.update(cx, f);
     }
 }
 

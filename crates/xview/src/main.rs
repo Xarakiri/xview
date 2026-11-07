@@ -1,6 +1,7 @@
 mod assets;
 mod bottom_bar;
 mod chart_view;
+#[cfg(debug_assertions)]
 mod debug_script;
 mod demo;
 mod left_toolbar;

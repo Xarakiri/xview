@@ -235,6 +235,7 @@ impl SymbolSearch {
         }
     }
 
+    #[cfg(debug_assertions)]
     pub(crate) fn pick_selected(&mut self, cx: &mut Context<Self>) {
         self.pick(self.selected, cx);
     }

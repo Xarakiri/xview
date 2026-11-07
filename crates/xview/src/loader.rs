@@ -25,6 +25,10 @@ use crate::workspace::Workspace;
 
 /// Candles per history request.
 pub const PAGE: usize = 1000;
+/// Candles re-fetched right after a cache-miss open lands, to correct bars
+/// that closed while the first page was in flight (live updates are dropped
+/// until the series is on screen).
+pub const LANDING_BACKFILL: usize = 10;
 
 /// Runs `f` only while `token` is still the current one. Returns whether it ran.
 pub fn apply_if_current(guard: &LoadGuard, token: &LoadToken, f: impl FnOnce()) -> bool {
@@ -33,6 +37,89 @@ pub fn apply_if_current(guard: &LoadGuard, token: &LoadToken, f: impl FnOnce()) 
         true
     } else {
         false
+    }
+}
+
+/// Token bookkeeping of the loader, free of GPUI so the real decision path
+/// is unit-testable.
+#[derive(Debug, Default)]
+pub struct LoadState {
+    guard: LoadGuard,
+    /// Token whose series the chart displays.
+    shown: Option<LoadToken>,
+    /// Token of the older-page request in flight, if any. While one is in
+    /// flight the chart's `loading_older` flag is set.
+    older: Option<LoadToken>,
+}
+
+/// What to do with a finished older-page request.
+#[derive(Debug, PartialEq)]
+pub enum OlderOutcome {
+    Apply,
+    Failed,
+    /// For a previous open. `reset_flag`: its series is still on screen, so
+    /// the chart's loading flag must be cleared.
+    Stale { reset_flag: bool },
+}
+
+impl LoadState {
+    /// Starts an open: issues a new token. The bool says an older request was
+    /// in flight and has been abandoned, so the caller must clear the chart's
+    /// loading flag (the new open may fail and leave the old series up).
+    pub fn begin_open(&mut self) -> (LoadToken, bool) {
+        let token = self.guard.next();
+        (token, self.older.take().is_some())
+    }
+
+    pub fn is_current(&self, token: &LoadToken) -> bool {
+        self.guard.is_current(token)
+    }
+
+    /// The first page of `token` arrived: lands only while current.
+    pub fn land(&mut self, token: LoadToken) -> bool {
+        let mut landed = false;
+        apply_if_current(&self.guard, &token, || landed = true);
+        if landed {
+            self.shown = Some(token);
+        }
+        landed
+    }
+
+    /// The series of `token` was put on screen synchronously (cache hit).
+    pub fn mark_shown(&mut self, token: LoadToken) {
+        self.shown = Some(token);
+    }
+
+    /// Live updates and backfills apply only to the current series on screen.
+    pub fn accepts(&self, token: &LoadToken) -> bool {
+        self.is_current(token) && self.shown == Some(*token)
+    }
+
+    /// Registers an older request for `token`; false when it must be refused
+    /// (the chart still shows a previous series).
+    pub fn begin_older(&mut self, token: LoadToken) -> bool {
+        if self.accepts(&token) {
+            self.older = Some(token);
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn finish_older(&mut self, token: LoadToken, ok: bool) -> OlderOutcome {
+        if self.older == Some(token) {
+            self.older = None;
+        }
+        if !self.is_current(&token) {
+            return OlderOutcome::Stale {
+                reset_flag: self.shown == Some(token),
+            };
+        }
+        if ok {
+            OlderOutcome::Apply
+        } else {
+            OlderOutcome::Failed
+        }
     }
 }
 
@@ -48,12 +135,10 @@ pub struct Loader {
     registry: SourceRegistry,
     csv: Arc<CsvSource>,
     cache: SeriesCache,
-    guard: LoadGuard,
+    state: LoadState,
     live: Option<Task<()>>,
     chart: Entity<ChartView>,
     current: Option<Current>,
-    /// Token whose series the chart displays.
-    shown: Option<LoadToken>,
     load: Option<Task<()>>,
     older: Option<Task<()>>,
     backfill: Option<Task<()>>,
@@ -71,11 +156,10 @@ impl Loader {
             registry,
             csv,
             cache: SeriesCache::new(),
-            guard: LoadGuard::new(),
+            state: LoadState::default(),
             live: None,
             chart,
             current: None,
-            shown: None,
             load: None,
             older: None,
             backfill: None,
@@ -91,7 +175,7 @@ impl Loader {
     }
 
     pub fn is_current(&self, token: &LoadToken) -> bool {
-        self.guard.is_current(token)
+        self.state.is_current(token)
     }
 
     pub fn supported_timeframes(&self, symbol: &Symbol) -> Vec<Timeframe> {
@@ -145,11 +229,16 @@ impl Loader {
         tf: Timeframe,
         cx: &mut Context<Workspace>,
     ) -> Result<(), DataError> {
-        let token = self.guard.next();
+        let (token, older_dropped) = self.state.begin_open();
         self.live = None;
         self.load = None;
         self.older = None;
         self.backfill = None;
+        if older_dropped {
+            // Otherwise `loading_older` sticks if this open fails and the
+            // previous series stays on screen.
+            self.chart.update(cx, |v, cx| v.older_failed(cx));
+        }
         self.current = Some(Current {
             symbol: symbol.clone(),
             tf,
@@ -159,7 +248,8 @@ impl Loader {
         let cached = self.cache.get(&symbol.key(), tf).cloned();
         let hit = cached.is_some();
         if let Some(series) = cached {
-            self.show(token, series, cx);
+            self.state.mark_shown(token);
+            self.show(series, cx);
         } else {
             let task = Tokio::spawn(cx, src.history(&symbol, tf, None, PAGE));
             self.load = Some(cx.spawn(async move |ws, cx| {
@@ -181,19 +271,19 @@ impl Loader {
         let Some(cur) = self.current.clone() else {
             return false;
         };
-        let mut landed = false;
-        apply_if_current(&self.guard, &token, || landed = true);
-        if !landed {
+        if !self.state.land(token) {
             return false;
         }
         let series = Series::new(cur.symbol, cur.tf, page.candles, page.has_more);
-        self.show(token, series, cx);
+        self.show(series, cx);
+        if self.live.is_some() {
+            self.request_backfill(token, LANDING_BACKFILL, cx);
+        }
         true
     }
 
-    fn show(&mut self, token: LoadToken, series: Series, cx: &mut Context<Workspace>) {
+    fn show(&mut self, series: Series, cx: &mut Context<Workspace>) {
         self.cache.insert(series.clone());
-        self.shown = Some(token);
         let name = self
             .registry
             .get(&series.symbol.source)
@@ -223,7 +313,7 @@ impl Loader {
         let Some(mut stream) = stream else { return };
         if cache_hit {
             // The cached copy missed the candles since it was last shown.
-            self.request_backfill(token, cx);
+            self.request_backfill(token, PAGE, cx);
         }
         self.live = Some(cx.spawn(async move |ws, cx| {
             while let Some(update) = stream.next().await {
@@ -236,7 +326,7 @@ impl Loader {
     }
 
     fn on_live(&mut self, token: LoadToken, update: CandleUpdate, cx: &mut Context<Workspace>) {
-        if !self.guard.is_current(&token) || self.shown != Some(token) {
+        if !self.state.accepts(&token) {
             return;
         }
         match update {
@@ -248,20 +338,20 @@ impl Loader {
                 }
                 self.chart.update(cx, |v, cx| v.apply_update(c, cx));
             }
-            CandleUpdate::Reconnected => self.request_backfill(token, cx),
+            CandleUpdate::Reconnected => self.request_backfill(token, PAGE, cx),
             CandleUpdate::Disconnected => {}
         }
     }
 
-    /// Fetches the latest page and merges it, filling any gap.
-    fn request_backfill(&mut self, token: LoadToken, cx: &mut Context<Workspace>) {
+    /// Fetches the latest `limit` candles and merges them, filling any gap.
+    fn request_backfill(&mut self, token: LoadToken, limit: usize, cx: &mut Context<Workspace>) {
         let Some(cur) = self.current.clone() else {
             return;
         };
         let Ok(src) = self.source(&cur.symbol) else {
             return;
         };
-        let task = Tokio::spawn(cx, src.history(&cur.symbol, cur.tf, None, PAGE));
+        let task = Tokio::spawn(cx, src.history(&cur.symbol, cur.tf, None, limit));
         self.backfill = Some(cx.spawn(async move |ws, cx| {
             let result = flatten(task.await);
             ws.update(cx, |ws, cx| ws.on_backfill(token, result, cx))
@@ -276,7 +366,7 @@ impl Loader {
         page: HistoryPage,
         cx: &mut Context<Workspace>,
     ) -> bool {
-        if !self.guard.is_current(&token) || self.shown != Some(token) {
+        if !self.state.accepts(&token) {
             return false;
         }
         let Some(cur) = &self.current else {
@@ -296,7 +386,7 @@ impl Loader {
             return;
         };
         let src = match self.source(&cur.symbol) {
-            Ok(src) if self.shown == Some(cur.token) => src,
+            Ok(src) if self.state.begin_older(cur.token) => src,
             // The chart still shows a previous series (or nothing loadable):
             // clear its loading flag so a later pan can ask again.
             _ => {
@@ -323,13 +413,14 @@ impl Loader {
         result: Result<HistoryPage, DataError>,
         cx: &mut Context<Workspace>,
     ) -> Result<(), DataError> {
-        if !self.guard.is_current(&token) {
-            // Stale. If its series is still on screen (the newer open has not
-            // landed yet), nothing else will reset the flag.
-            if self.shown == Some(token) {
-                self.chart.update(cx, |v, cx| v.older_failed(cx));
+        match self.state.finish_older(token, result.is_ok()) {
+            OlderOutcome::Stale { reset_flag } => {
+                if reset_flag {
+                    self.chart.update(cx, |v, cx| v.older_failed(cx));
+                }
+                return Ok(());
             }
-            return Ok(());
+            OlderOutcome::Apply | OlderOutcome::Failed => {}
         }
         let cur = self.current.clone().expect("current token implies an open");
         match result {
@@ -371,6 +462,54 @@ mod tests {
             *shown.borrow_mut() = Some("first")
         }));
         assert_eq!(*shown.borrow(), Some("second"));
+    }
+
+    #[test]
+    fn open_abandoning_an_older_request_reports_it() {
+        let mut st = LoadState::default();
+        let (a, dropped) = st.begin_open();
+        assert!(!dropped);
+        assert!(st.land(a));
+        assert!(st.begin_older(a));
+        // A new open while the older page is in flight: the caller must clear
+        // the chart's loading flag, since this open may fail.
+        let (b, dropped) = st.begin_open();
+        assert!(dropped);
+        // The abandoned response, if it still arrived, is stale and its
+        // series is still on screen.
+        assert_eq!(st.finish_older(a, true), OlderOutcome::Stale { reset_flag: true });
+        // Once b lands, nothing about a touches the chart.
+        assert!(st.land(b));
+        assert_eq!(st.finish_older(a, false), OlderOutcome::Stale { reset_flag: false });
+        let (_c, dropped) = st.begin_open();
+        assert!(!dropped);
+    }
+
+    #[test]
+    fn older_requests_need_the_current_series_on_screen() {
+        let mut st = LoadState::default();
+        let (a, _) = st.begin_open();
+        assert!(st.land(a));
+        let (b, _) = st.begin_open();
+        // b is pending: the chart shows a's series, so b's older is refused.
+        assert!(!st.begin_older(b));
+        assert!(!st.accepts(&b));
+        assert!(!st.accepts(&a));
+        st.mark_shown(b);
+        assert!(st.begin_older(b));
+        assert_eq!(st.finish_older(b, true), OlderOutcome::Apply);
+        assert!(st.begin_older(b));
+        assert_eq!(st.finish_older(b, false), OlderOutcome::Failed);
+    }
+
+    #[test]
+    fn late_first_page_does_not_land() {
+        let mut st = LoadState::default();
+        let (a, _) = st.begin_open();
+        let (b, _) = st.begin_open();
+        assert!(st.land(b));
+        assert!(!st.land(a));
+        assert!(st.accepts(&b));
     }
 
     #[test]
