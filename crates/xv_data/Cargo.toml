@@ -6,3 +6,6 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+xv_core = { path = "../xv_core" }
+futures = { workspace = true }
+thiserror = { workspace = true }

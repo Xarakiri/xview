@@ -5830,6 +5830,11 @@ dependencies = [
 [[package]]
 name = "xv_data"
 version = "0.1.0"
+dependencies = [
+ "futures",
+ "thiserror",
+ "xv_core",
+]
 
 [[package]]
 name = "xv_drawings"
