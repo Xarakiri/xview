@@ -34,15 +34,41 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
         COUNTER.fetch_add(1, Ordering::Relaxed)
     ));
     let result = (|| {
-        let mut f = std::fs::File::create(&tmp)?;
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp)?;
         f.write_all(bytes)?;
         f.sync_all()?;
-        std::fs::rename(&tmp, path)
+        std::fs::rename(&tmp, path)?;
+        if let Ok(d) = std::fs::File::open(parent) {
+            let _ = d.sync_all();
+        }
+        Ok(())
     })();
     if result.is_err() {
         let _ = std::fs::remove_file(&tmp);
     }
     result
+}
+
+/// Errors with `InvalidData` if `path` exists but is unreadable or fails
+/// `valid`, so a save never replaces a file that has no backup.
+pub(crate) fn refuse_if_unparseable(
+    path: &Path,
+    valid: impl Fn(&str) -> bool,
+) -> std::io::Result<()> {
+    match std::fs::read(path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Ok(b) if std::str::from_utf8(&b).is_ok_and(&valid) => Ok(()),
+        _ => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "refusing to overwrite unreadable/corrupt file {}",
+                path.display()
+            ),
+        )),
+    }
 }
 
 /// Renames `path` to `<name>.corrupt-<unix>` (suffixed `-1`, `-2`... if taken)

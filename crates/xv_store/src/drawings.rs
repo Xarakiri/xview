@@ -1,4 +1,4 @@
-use crate::atomic::{move_aside, write_atomic};
+use crate::atomic::{move_aside, refuse_if_unparseable, write_atomic};
 use std::path::{Path, PathBuf};
 use xv_core::SymbolKey;
 use xv_drawings::{Drawing, DrawingsFile, FILE_VERSION, from_json, to_json};
@@ -7,9 +7,11 @@ use xv_drawings::{Drawing, DrawingsFile, FILE_VERSION, from_json, to_json};
 pub enum LoadedDrawings {
     Ok(Vec<Drawing>),
     Missing,
-    /// The file was unreadable or invalid and was moved here, untouched.
+    /// Unreadable or invalid. `path` is the backup when `moved`, otherwise the
+    /// original (still in place; `save_drawings` refuses to overwrite it).
     Corrupt {
-        moved_to: PathBuf,
+        path: PathBuf,
+        moved: bool,
     },
 }
 
@@ -65,10 +67,13 @@ pub fn load_drawings(dir: &Path, key: &SymbolKey) -> LoadedDrawings {
 
 fn aside(path: &Path) -> LoadedDrawings {
     match move_aside(path) {
-        Ok(moved_to) => LoadedDrawings::Corrupt { moved_to },
-        // Could not move it; report the original so the caller never saves over silently.
+        Ok(p) => LoadedDrawings::Corrupt {
+            path: p,
+            moved: true,
+        },
         Err(_) => LoadedDrawings::Corrupt {
-            moved_to: path.to_path_buf(),
+            path: path.to_path_buf(),
+            moved: false,
         },
     }
 }
@@ -79,7 +84,9 @@ pub fn save_drawings(dir: &Path, key: &SymbolKey, ds: &[Drawing]) -> std::io::Re
         symbol: format!("{}:{}", key.source.0, key.id),
         drawings: ds.to_vec(),
     };
-    write_atomic(&drawings_path(dir, key), to_json(&file).as_bytes())
+    let path = drawings_path(dir, key);
+    refuse_if_unparseable(&path, |s| from_json(s).is_ok())?;
+    write_atomic(&path, to_json(&file).as_bytes())
 }
 
 #[cfg(test)]
@@ -137,7 +144,11 @@ mod tests {
         let p = drawings_path(t.path(), &k);
         std::fs::create_dir_all(p.parent().unwrap()).unwrap();
         std::fs::write(&p, "{garbage").unwrap();
-        let LoadedDrawings::Corrupt { moved_to } = load_drawings(t.path(), &k) else {
+        let LoadedDrawings::Corrupt {
+            path: moved_to,
+            moved: true,
+        } = load_drawings(t.path(), &k)
+        else {
             panic!("expected Corrupt")
         };
         assert_eq!(std::fs::read_to_string(&moved_to).unwrap(), "{garbage");
@@ -153,7 +164,11 @@ mod tests {
         let mut seen = std::collections::HashSet::new();
         for i in 0..3 {
             std::fs::write(&p, format!(r#"{{"version":9,"n":{i}}}"#)).unwrap();
-            let LoadedDrawings::Corrupt { moved_to } = load_drawings(t.path(), &k) else {
+            let LoadedDrawings::Corrupt {
+                path: moved_to,
+                moved: true,
+            } = load_drawings(t.path(), &k)
+            else {
                 panic!("expected Corrupt")
             };
             assert!(seen.insert(moved_to.clone()));
@@ -175,6 +190,44 @@ mod tests {
         let long = "z".repeat(200);
         let name = drawings_path(t, &key(&long));
         assert!(name.file_name().unwrap().len() < 64 + 1 + 16 + 5 + 1);
+    }
+
+    #[test]
+    fn save_refuses_to_overwrite_unbacked_corrupt_drawings() {
+        let t = tempfile::TempDir::new().unwrap();
+        let k = key("x");
+        let p = drawings_path(t.path(), &k);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(&p, "{garbage").unwrap();
+        let err = save_drawings(t.path(), &k, &[drawing(1)]).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), "{garbage");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn move_aside_failure_reports_unmoved() {
+        use std::os::unix::fs::PermissionsExt;
+        let t = tempfile::TempDir::new().unwrap();
+        let k = key("x");
+        let p = drawings_path(t.path(), &k);
+        let dir = p.parent().unwrap().to_path_buf();
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(&p, "{garbage").unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let can_write = std::fs::write(dir.join("probe"), "x").is_ok();
+        let res = load_drawings(t.path(), &k);
+        let guard = save_drawings(t.path(), &k, &[drawing(1)]);
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        if can_write {
+            return; // running as root: cannot simulate rename failure
+        }
+        match res {
+            LoadedDrawings::Corrupt { path, moved: false } => assert_eq!(path, p),
+            other => panic!("unexpected {other:?}"),
+        }
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), "{garbage");
+        assert!(guard.is_err());
     }
 
     #[test]

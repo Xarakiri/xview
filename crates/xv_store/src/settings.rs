@@ -1,4 +1,4 @@
-use crate::atomic::{move_aside, write_atomic};
+use crate::atomic::{move_aside, refuse_if_unparseable, write_atomic};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 use xv_core::{SymbolKey, Timeframe};
@@ -77,7 +77,9 @@ pub fn load_settings(dir: &Path) -> Settings {
 
 pub fn save_settings(dir: &Path, s: &Settings) -> std::io::Result<()> {
     let json = serde_json::to_string_pretty(s).expect("settings serialize");
-    write_atomic(&dir.join(FILE), json.as_bytes())
+    let path = dir.join(FILE);
+    refuse_if_unparseable(&path, |s| serde_json::from_str::<Settings>(s).is_ok())?;
+    write_atomic(&path, json.as_bytes())
 }
 
 #[cfg(test)]
@@ -134,5 +136,15 @@ mod tests {
             .collect();
         assert_eq!(moved.len(), 1);
         assert_eq!(std::fs::read_to_string(&moved[0]).unwrap(), "{garbage");
+    }
+
+    #[test]
+    fn save_settings_refuses_to_overwrite_unbacked_corrupt() {
+        let t = tempfile::TempDir::new().unwrap();
+        let p = t.path().join("settings.json");
+        std::fs::write(&p, "{garbage").unwrap();
+        let err = save_settings(t.path(), &Settings::default()).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), "{garbage");
     }
 }
