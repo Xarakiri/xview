@@ -109,6 +109,26 @@ pub struct TimeTick {
     pub major: bool,
 }
 
+/// Time zone the sources bucket daily, weekly and monthly bars in. Binance
+/// and CSV files both start a day at UTC midnight (and a month on the 1st,
+/// UTC), so those bars are labelled with their date there: in the display
+/// zone a day bar would show the previous date west of UTC.
+const DAILY_BUCKET_TZ: TzOffset = TzOffset::UTC;
+
+/// The zone a bar of `tf` is labelled in: the display zone `tz` for intraday
+/// bars, the bucket zone for D/W/M bars.
+fn label_tz(tf: Timeframe, tz: TzOffset) -> TzOffset {
+    if tf.nominal_ms() < DAY_MS {
+        tz
+    } else {
+        DAILY_BUCKET_TZ
+    }
+}
+
+fn gcd(a: i64, b: i64) -> i64 {
+    if b == 0 { a.abs() } else { gcd(b, a % b) }
+}
+
 fn date_of(local_ms: i64) -> NaiveDate {
     chrono::DateTime::from_timestamp_millis(local_ms)
         .map(|d| d.date_naive())
@@ -122,18 +142,24 @@ pub fn time_ticks(candles: &[Candle], tf: Timeframe, vp: &Viewport, tz: TzOffset
     if range.is_empty() || vp.bar_spacing <= 0.0 {
         return Vec::new();
     }
-    let tz_ms = tz.seconds as i64 * 1000;
+    let tz_ms = label_tz(tf, tz).seconds as i64 * 1000;
     let min_gap = (TIME_LABEL_SPACING_PX / vp.bar_spacing).max(1.0) as f64;
     let bars_per_label = (TIME_LABEL_SPACING_PX / vp.bar_spacing).ceil().max(1.0) as i64;
     let intraday = tf.nominal_ms() < DAY_MS;
     // Regular intraday labels sit on round clock times.
     let clock_step = if intraday {
         let need = bars_per_label * tf.nominal_ms();
-        const STEPS_MIN: [i64; 11] = [1, 5, 15, 30, 60, 120, 180, 360, 720, 1440, 1440];
+        const STEPS_MIN: [i64; 10] = [1, 5, 15, 30, 60, 120, 180, 360, 720, 1440];
         STEPS_MIN.iter().map(|m| m * 60_000).find(|s| *s >= need)
     } else {
         None
     };
+    // Bars open on UTC multiples of the bar length, so with an offset that
+    // isn't a multiple of it (+5:30, +5:45, or -5h on 2h bars) no bar sits on
+    // a round local time. Labels then sit on round local times shifted by
+    // the part of the offset the bars can't express: 05:30, 11:30, ... at
+    // +5:30. Offsets the bars can express get round local times as before.
+    let clock_shift = clock_step.map_or(0, |step| tz_ms.rem_euclid(gcd(tf.nominal_ms(), step)));
 
     // Candidates: (priority, tick). Year > month > day changes > regular labels.
     let mut cands: Vec<(u8, TimeTick)> = Vec::new();
@@ -173,7 +199,7 @@ pub fn time_ticks(candles: &[Candle], tf: Timeframe, vp: &Viewport, tz: TzOffset
                 ));
             }
         } else if let Some(step) = clock_step
-            && local.rem_euclid(DAY_MS) % step == 0
+            && (local - clock_shift).rem_euclid(DAY_MS) % step == 0
         {
             {
                 let t = chrono::DateTime::from_timestamp_millis(local).unwrap_or_default();
@@ -214,9 +240,10 @@ pub fn time_ticks(candles: &[Candle], tf: Timeframe, vp: &Viewport, tz: TzOffset
     kept
 }
 
-/// `"Mon 09 Nov '26  13:40"` for intraday timeframes, `"Mon 09 Nov '26"` otherwise.
+/// `"Mon 09 Nov '26  13:40"` for intraday timeframes, in `tz`; the bar's
+/// date `"Mon 09 Nov '26"` for D/W/M bars (in the zone they are bucketed in).
 pub fn format_crosshair_time(ts_ms: i64, tf: Timeframe, tz: TzOffset) -> String {
-    let local = ts_ms.saturating_add(tz.seconds as i64 * 1000);
+    let local = ts_ms.saturating_add(label_tz(tf, tz).seconds as i64 * 1000);
     let dt = chrono::DateTime::from_timestamp_millis(local).unwrap_or_default();
     let date = format!(
         "{} {:02} {} '{:02}",
@@ -386,5 +413,112 @@ mod tests {
     fn time_ticks_empty_and_bounded() {
         let vp = Viewport::new(800.0, 400.0);
         assert!(time_ticks(&[], Timeframe::H1, &vp, TzOffset::UTC).is_empty());
+    }
+
+    const MINUS5: TzOffset = TzOffset { seconds: -18_000 };
+    const PLUS530: TzOffset = TzOffset { seconds: 19_800 };
+    const PLUS545: TzOffset = TzOffset { seconds: 20_700 };
+
+    fn month_bars(y0: i32, n: u32) -> Vec<Candle> {
+        (0..n)
+            .map(|k| bar(chrono_ts(y0 + (k / 12) as i32, k % 12 + 1, 1, 0, 0)))
+            .collect()
+    }
+
+    #[test]
+    fn daily_and_monthly_crosshair_shows_the_bars_date_in_any_zone() {
+        // A D bar opens at UTC midnight: west of UTC that instant is the
+        // previous evening, but the bar is still Mon 09 Nov.
+        let day = chrono_ts(2026, 11, 9, 0, 0);
+        let month = chrono_ts(2026, 11, 1, 0, 0);
+        for tz in [MINUS5, PLUS530, PLUS545, TzOffset::UTC] {
+            assert_eq!(format_crosshair_time(day, Timeframe::D1, tz), "Mon 09 Nov '26");
+            assert_eq!(format_crosshair_time(day, Timeframe::W1, tz), "Mon 09 Nov '26");
+            assert_eq!(format_crosshair_time(month, Timeframe::Mo1, tz), "Sun 01 Nov '26");
+        }
+        // Intraday stays in the display zone.
+        assert_eq!(format_crosshair_time(day, Timeframe::H1, MINUS5), "Sun 08 Nov '26  19:00");
+        assert_eq!(format_crosshair_time(day, Timeframe::H1, PLUS530), "Mon 09 Nov '26  05:30");
+        assert_eq!(format_crosshair_time(day, Timeframe::H1, PLUS545), "Mon 09 Nov '26  05:45");
+    }
+
+    #[test]
+    fn daily_axis_labels_months_on_the_first_west_of_utc() {
+        let t0 = chrono_ts(2025, 11, 1, 0, 0);
+        let cs: Vec<Candle> = (0..120).map(|i| bar(t0 + i * DAY)).collect();
+        let mut vp = Viewport::new(1200.0, 400.0);
+        vp.bar_spacing = 10.0;
+        vp.right_index = 120.0;
+        for tz in [MINUS5, PLUS530, PLUS545] {
+            let ticks = time_ticks(&cs, Timeframe::D1, &vp, tz);
+            let at = |label: &str| ticks.iter().find(|t| t.major && t.label == label).map(|t| t.index);
+            // 2025-12-01 is bar 30, 2026-01-01 bar 61, 2026-02-01 bar 92.
+            assert_eq!(at("Dec"), Some(30), "{tz:?} {ticks:?}");
+            assert_eq!(at("2026"), Some(61), "{tz:?} {ticks:?}");
+            assert_eq!(at("Feb"), Some(92), "{tz:?} {ticks:?}");
+            // Day-number labels name each bar's own date.
+            for t in ticks.iter().filter(|t| !t.major) {
+                let d = date_of(cs[t.index].open_time_ms);
+                assert_eq!(t.label, d.day().to_string(), "{tz:?} {t:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn monthly_axis_labels_years_on_january_west_of_utc() {
+        let cs = month_bars(2024, 36);
+        let mut vp = Viewport::new(1080.0, 400.0);
+        vp.bar_spacing = 30.0;
+        vp.right_index = 36.0;
+        for tz in [MINUS5, PLUS530, PLUS545] {
+            let ticks = time_ticks(&cs, Timeframe::Mo1, &vp, tz);
+            let years: Vec<_> = ticks
+                .iter()
+                .filter(|t| t.major && t.label.len() == 4)
+                .map(|t| (t.index, t.label.as_str()))
+                .collect();
+            assert_eq!(years, [(12, "2025"), (24, "2026")], "{tz:?} {ticks:?}");
+            // Month labels name each bar's own month.
+            for t in ticks.iter().filter(|t| t.label.len() == 3) {
+                let m = date_of(cs[t.index].open_time_ms).month0() as usize;
+                assert_eq!(t.label, MONTHS[m], "{tz:?} {t:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn hourly_axis_has_clock_labels_with_any_offset() {
+        let t0 = chrono_ts(2026, 11, 9, 0, 0);
+        let cs: Vec<Candle> = (0..72).map(|i| bar(t0 + i * H)).collect();
+        let mut vp = Viewport::new(720.0, 400.0);
+        vp.bar_spacing = 10.0;
+        vp.right_index = 72.0;
+        for (tz, minute) in [(MINUS5, ":00"), (PLUS530, ":30"), (PLUS545, ":45"), (TzOffset::UTC, ":00")] {
+            let ticks = time_ticks(&cs, Timeframe::H1, &vp, tz);
+            let clock: Vec<_> = ticks.iter().filter(|t| t.label.contains(':')).collect();
+            assert!(clock.len() >= 2, "{tz:?} {ticks:?}");
+            assert!(clock.iter().all(|t| t.label.ends_with(minute)), "{tz:?} {ticks:?}");
+            // Day changes follow the display zone: the first bar of a local day.
+            let local_day = |i: usize| date_of(cs[i].open_time_ms + tz.seconds as i64 * 1000);
+            for t in ticks.iter().filter(|t| t.major) {
+                assert_ne!(local_day(t.index), local_day(t.index - 1), "{tz:?} {t:?}");
+            }
+            assert!(ticks.iter().any(|t| t.major), "{tz:?} {ticks:?}");
+        }
+    }
+
+    #[test]
+    fn two_hour_bars_get_labels_with_an_odd_hour_offset() {
+        let t0 = chrono_ts(2026, 11, 9, 0, 0);
+        let cs: Vec<Candle> = (0..60).map(|i| bar(t0 + i * 2 * H)).collect();
+        // 30 px per bar: a label every 6 h. At -5h the bars open at odd
+        // local hours, so none is on 00/06/12/18.
+        let mut vp = Viewport::new(1800.0, 400.0);
+        vp.bar_spacing = 30.0;
+        vp.right_index = 60.0;
+        let ticks = time_ticks(&cs, Timeframe::H2, &vp, MINUS5);
+        let clock: Vec<_> = ticks.iter().filter(|t| t.label.contains(':')).collect();
+        assert!(clock.len() >= 4, "{ticks:?}");
+        assert!(clock.iter().all(|t| ["01:00", "07:00", "13:00", "19:00"].contains(&t.label.as_str())), "{ticks:?}");
     }
 }
