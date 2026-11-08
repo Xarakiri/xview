@@ -41,6 +41,23 @@ cargo run -p xview --release
   Click a drawing to select it, drag its body to move it or a handle to resize.
   Delete or Backspace removes the selection, Esc cancels a drag or pending
   placement, then clears the selection, then drops the active tool. Cmd+Z undoes and Shift+Cmd+Z redoes.
+- While placing or dragging a point, hold Cmd to snap it to the nearest candle's
+  high or low. Hold Shift to lock a line to 0°, 45°, 90° and so on, or a
+  rectangle to a square. Shift wins over Cmd.
+- The magnet button in the left column toggles snapping to candle prices. Its
+  menu picks Weak magnet (snaps to the nearest open, high, low or close within
+  12 px) or Strong magnet (always snaps).
+- The pencil-with-lock button keeps the drawing tool active after each drawing.
+- A selected drawing shows a floating toolbar: templates, line and text color,
+  width, line style, settings, lock, delete and more. Drag it by its grip.
+  Right-click a drawing for the same actions.
+- Double-click a drawing, or press the toolbar's settings button, to open its
+  settings: style, text, exact coordinates and the timeframes it shows on.
+  Cancel reverts every change; Ok saves them as one undo step.
+- Cmd+C and Cmd+V copy and paste the selected drawing within the same symbol.
+  Cmd+D clones it.
+- New drawings use the last style you used for that tool. Save named styles
+  with the toolbar's templates menu.
 - Start typing a letter with the chart focused to open symbol search. Cmd+K
   opens it too.
 - Cmd+O opens a CSV file. Option+Cmd+T toggles the light and dark theme.
@@ -84,7 +101,8 @@ time,open,high,low,close,volume
 
 ## Where data is stored
 
-Drawings, last symbol, last timeframe and window size are saved under
+Drawings, drawing templates, last symbol, last timeframe, magnet mode and
+window size are saved under
 `~/Library/Application Support/XView/`. Set `XVIEW_DATA_DIR` to use another
 directory.
 
