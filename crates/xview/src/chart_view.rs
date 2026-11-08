@@ -17,7 +17,7 @@ use gpui::{
 };
 use xv_chart::{
     ChartColors, ChartEffect, ChartKey, ChartLayout, ChartState, DEFAULT_TEXT_SIZE, Dash, Frame,
-    Legend, MagnetMode, Mods, Prim, RectF, TextAlign,
+    Legend, MagnetMode, Mods, Prim, RectF, TextAlign, clamp_span,
 };
 use xv_core::{Candle, Series};
 
@@ -38,6 +38,8 @@ const TEXT_LINE_HEIGHT: f32 = 16.0;
 const LABEL_HEIGHT: f32 = xv_chart::AXIS_LABEL_HEIGHT;
 const LABEL_PAD_X: f32 = 4.0;
 const LABEL_RADIUS: f32 = 3.0;
+/// Gap kept between clamped drawing text and the plot edge.
+const TEXT_CLAMP_PAD: f32 = 2.0;
 const HANDLE_RADIUS: f32 = 4.5;
 const HANDLE_BORDER: f32 = 1.5;
 const DASH: [f32; 2] = [4.0, 4.0];
@@ -324,6 +326,7 @@ fn paint_frame(bounds: Bounds<Pixels>, p: &Prepared, window: &mut Window, cx: &m
         scale: window.scale_factor(),
         font: window.text_style().font(),
         background: u32_to_hsla(p.colors.background),
+        plot: p.layout.plot,
     };
     let c = &p.colors;
     let l = &p.layout;
@@ -382,6 +385,8 @@ struct TextLook<'a> {
     color: Hsla,
     font: &'a Font,
     size: f32,
+    /// Keep the text and its background inside the plot.
+    clamp: bool,
 }
 
 struct Painter {
@@ -389,6 +394,8 @@ struct Painter {
     scale: f32,
     font: Font,
     background: Hsla,
+    /// Plot rect (element coordinates), for clamped text.
+    plot: RectF,
 }
 
 impl Painter {
@@ -454,6 +461,7 @@ impl Painter {
                 size,
                 bold,
                 italic,
+                clamp,
             } => {
                 let mut font = self.font.clone();
                 if *bold {
@@ -469,6 +477,7 @@ impl Painter {
                         color: u32_to_hsla(*color),
                         font: &font,
                         size: *size,
+                        clamp: *clamp,
                     },
                     *align,
                     bg.map(u32_to_hsla),
@@ -607,11 +616,19 @@ impl Painter {
         let line = self.shape(text, look.font, look.size, &[(text.len(), look.color)], window);
         let line_h = TEXT_LINE_HEIGHT.max(look.size * 1.25);
         let w = f32::from(line.width());
-        let x = match align {
+        let mut x = match align {
             TextAlign::Left => pos.0,
             TextAlign::Center => pos.0 - w / 2.0,
             TextAlign::Right => pos.0 - w,
         };
+        let mut pos = pos;
+        if look.clamp {
+            let pl = &self.plot;
+            let pad = if bg.is_some() { LABEL_PAD_X } else { 0.0 } + TEXT_CLAMP_PAD;
+            x = clamp_span(x - pad, w + 2.0 * pad, pl.x, pl.x + pl.w) + pad;
+            let h = if bg.is_some() { line_h.max(LABEL_HEIGHT) } else { line_h };
+            pos.1 = clamp_span(pos.1 - h / 2.0, h, pl.y, pl.y + pl.h) + h / 2.0;
+        }
         if let Some(bg) = bg {
             let (bx, by) = (x - LABEL_PAD_X, pos.1 - LABEL_HEIGHT / 2.0);
             window.paint_quad(

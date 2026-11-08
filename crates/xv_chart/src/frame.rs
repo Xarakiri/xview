@@ -119,6 +119,9 @@ pub enum Prim {
         size: f32,
         bold: bool,
         italic: bool,
+        /// Keep the whole text (and its background) inside the plot: for
+        /// drawing text and stats, which may sit near or past an edge.
+        clamp: bool,
     },
     /// A selection handle; `filled: false` (a locked drawing) is drawn
     /// without the background disc.
@@ -247,6 +250,7 @@ impl Out {
             size: DEFAULT_TEXT_SIZE,
             bold: false,
             italic: false,
+            clamp: false,
         });
     }
 }
@@ -355,12 +359,11 @@ fn format_change(from: f64, to: f64, tick: f64) -> String {
     } else {
         0.0
     };
-    let sign = if diff >= 0.0 { "+" } else { "-" };
-    format!(
-        "{sign}{} ({sign}{:.2}%)",
-        format_price(diff.abs(), tick),
-        pct.abs()
-    )
+    let abs = format_price(diff.abs(), tick);
+    // A change that rounds to zero is "+0.00", never "-0.00".
+    let zero = !abs.bytes().any(|c| (b'1'..=b'9').contains(&c));
+    let sign = if diff >= 0.0 || zero { "+" } else { "-" };
+    format!("{sign}{abs} ({sign}{:.2}%)", pct.abs())
 }
 
 /// A duration in its two largest units: `2w 3d`, `1d 3h`, `45m`.
@@ -416,13 +419,15 @@ pub fn build_frame(i: &FrameInput) -> Frame {
             let (prices, n) = anchor_prices(&d.kind);
             for &p in &prices[..n] {
                 let y = vp.y_of_price(p);
-                if (0.0..=ph).contains(&y) {
+                // One label per level: a label within a label height of the
+                // last price, the crosshair or a placed label is skipped.
+                if (0.0..=ph).contains(&y) && !hidden_by_boxed_label(y, &boxed) {
                     labels.push((y, with_alpha(d.style.color, 0xFF), p));
+                    boxed.push(y);
                 }
             }
         }
     }
-    boxed.extend(labels.iter().map(|l| l.0));
 
     // Grid and axis tick labels.
     for v in price_ticks(vp.price, vp.height, tick) {
@@ -599,6 +604,12 @@ pub fn build_frame(i: &FrameInput) -> Frame {
     }
 }
 
+/// The start of a span of length `len`, moved as little as possible to fit
+/// in `lo..=hi`; a span longer than the range starts at `lo`.
+pub fn clamp_span(start: f32, len: f32, lo: f32, hi: f32) -> f32 {
+    start.min(hi - len).max(lo)
+}
+
 /// Whether `d` is drawn on timeframe `tf`.
 fn is_shown(d: &Drawing, tf: Timeframe) -> bool {
     !d.hidden && d.style.visibility.shows(tf)
@@ -761,6 +772,7 @@ fn text_block(plot: &mut Out, t: &TextStyle, x: f32, align: TextAlign, top: f32)
             size: t.size as f32,
             bold: t.bold,
             italic: t.italic,
+            clamp: true,
         });
     }
 }
@@ -777,6 +789,8 @@ fn stats_text(d: &Drawing, a: Anchor, b: Anchor, pa: P64, pb: P64, rect: bool, i
     s.push_str(&format!(", {bars:.0} bars"));
     if !rect {
         let deg = (-(pb.1 - pa.1)).atan2(pb.0 - pa.0).to_degrees();
+        // Round first, then `+ 0.0` turns a rounded -0.0 into 0.0.
+        let deg = (deg * 10.0).round() / 10.0 + 0.0;
         s.push_str(&format!(
             ", {}, {:.1}°",
             format_span(b.time_ms - a.time_ms),
@@ -800,6 +814,7 @@ fn push_stats(plot: &mut Out, text: String, pos: (f32, f32), align: TextAlign, i
         size: DEFAULT_TEXT_SIZE,
         bold: false,
         italic: false,
+        clamp: true,
     });
 }
 
@@ -992,8 +1007,10 @@ fn draw_rect(
         dot(plot, center, st.color);
     }
     // Text inside the box (the unextended one, clamped to the plot).
-    let (bx0, bx1) = (pa.0.min(pb.0).max(0.0) as f32, pa.0.max(pb.0).min(w) as f32);
-    let (by0, by1) = (y0.max(0.0) as f32, y1.min(h) as f32);
+    let bx0 = pa.0.min(pb.0).clamp(0.0, w) as f32;
+    let bx1 = (pa.0.max(pb.0).clamp(0.0, w) as f32).max(bx0);
+    let by0 = y0.clamp(0.0, h) as f32;
+    let by1 = (y1.clamp(0.0, h) as f32).max(by0);
     if !st.text.content.is_empty() {
         let (x, align) = match st.text.halign {
             HAlign::Left => (bx0 + TEXT_GAP, TextAlign::Left),
@@ -1659,13 +1676,13 @@ mod tests {
         )];
         let f = run(&s, &vp, &layout, |i| i.drawings = &d);
         assert!(texts(&f).is_empty());
-        let f = run(&s, &vp, &layout, |i| {
+        // 1 price unit per px: 10 bars = 80 px right, +12.34 = 12.34 px up.
+        let uvp = unit_vp(&vp);
+        let f = run(&s, &uvp, &layout, |i| {
             i.drawings = &d;
             i.selected = Some(DrawingId(1));
         });
-        let pa = screen(&s, &vp, a);
-        let deg = (-(pb.1 - pa.1) as f64).atan2((pb.0 - pa.0) as f64).to_degrees();
-        let want = format!("+12.34 (+12.34%), 10 bars, 10h, {deg:.1}°");
+        let want = "+12.34 (+12.34%), 10 bars, 10h, 8.8°";
         assert!(
             matches!(texts(&f)[0], Prim::Text { text, .. } if *text == want),
             "{:?} vs {want}",
@@ -1687,6 +1704,115 @@ mod tests {
         )];
         let f = run(&s, &vp, &layout, |i| i.drawings = &d);
         assert!(matches!(texts(&f)[0], Prim::Text { text, .. } if text == "+10.00 (+11.11%), 10 bars"));
+    }
+
+    /// `vp` with one price unit per pixel (plot height 500).
+    fn unit_vp(vp: &Viewport) -> Viewport {
+        let mut u = vp.clone();
+        u.price = PriceRange {
+            min: 0.0,
+            max: u.height as f64,
+        };
+        u.auto_scale = false;
+        u
+    }
+
+    fn stats_of(f: &Frame) -> Vec<String> {
+        texts(f)
+            .iter()
+            .filter_map(|p| match p {
+                Prim::Text { text, .. } => Some(text.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn stats_angle_is_exact_and_never_negative_zero() {
+        let (s, layout, vp) = setup();
+        let vp = unit_vp(&vp);
+        let st = Style {
+            stats: StatsMode::Values,
+            always_stats: true,
+            ..Style::default()
+        };
+        let d = [
+            // Flat, and a hair below flat: both 0.0°, never -0.0°.
+            trend(1, anchor(10, 100.0), anchor(20, 100.0), st.clone()),
+            trend(2, anchor(10, 200.0), anchor(20, 199.999), st.clone()),
+            // 80 px right, 80 px up.
+            trend(3, anchor(10, 300.0), anchor(20, 380.0), st),
+        ];
+        let f = run(&s, &vp, &layout, |i| i.drawings = &d);
+        let got = stats_of(&f);
+        assert!(got[0].ends_with(", 0.0°"), "{got:?}");
+        assert!(got[1].ends_with(", 0.0°"), "{got:?}");
+        assert!(got[2].ends_with(", 45.0°"), "{got:?}");
+        assert!(got.iter().all(|t| !t.contains("-0.0")), "{got:?}");
+        assert!(got[1].starts_with("+0.00 (+0.00%)"), "{got:?}");
+    }
+
+    #[test]
+    fn price_labels_are_deduplicated() {
+        let (s, layout, vp) = setup();
+        let st = Style {
+            price_labels: true,
+            ..Style::default()
+        };
+        let flat = Drawing::new(
+            DrawingId(1),
+            DrawingKind::Rectangle {
+                a: anchor(10, 100.0),
+                b: anchor(20, 100.0),
+            },
+            st.clone(),
+        );
+        // A second drawing 1 px away: hidden under the first label.
+        let close = Drawing::new(
+            DrawingId(2),
+            DrawingKind::HorizontalLine {
+                price: vp.price_of_y(vp.y_of_price(100.0) + 1.0),
+            },
+            st.clone(),
+        );
+        // At the last close: the last-price label wins.
+        let last = s.last().unwrap().close;
+        let at_last = Drawing::new(
+            DrawingId(3),
+            DrawingKind::HorizontalLine { price: last },
+            Style {
+                color: 0x0E0E0EFF,
+                ..st
+            },
+        );
+        let d = [flat, close, at_last];
+        let f = run(&s, &vp, &layout, |i| i.drawings = &d);
+        let labels = axis_boxed(&f);
+        let drawing_color = Style::default().color;
+        assert_eq!(labels.iter().filter(|l| l.1 == drawing_color).count(), 1);
+        assert!(labels.iter().all(|l| l.1 != 0x0E0E0EFF), "{labels:?}");
+        // The last-price label is still there.
+        assert!(labels.iter().any(|l| l.0 == crate::format_price(last, 0.01)));
+    }
+
+    #[test]
+    fn clamp_span_keeps_spans_inside() {
+        assert_eq!(clamp_span(10.0, 20.0, 0.0, 100.0), 10.0);
+        assert_eq!(clamp_span(90.0, 20.0, 0.0, 100.0), 80.0);
+        assert_eq!(clamp_span(-5.0, 20.0, 0.0, 100.0), 0.0);
+        // Longer than the range: starts at lo.
+        assert_eq!(clamp_span(50.0, 200.0, 0.0, 100.0), 0.0);
+    }
+
+    #[test]
+    fn drawing_text_and_stats_are_marked_for_clamping() {
+        let (s, layout, vp) = setup();
+        let d = [trend(1, anchor(10, 100.0), anchor(20, 104.0), full_style())];
+        let f = run(&s, &vp, &layout, |i| i.drawings = &d);
+        assert!(texts(&f).len() >= 3);
+        assert!(texts(&f).iter().all(|p| matches!(p, Prim::Text { clamp: true, .. })));
+        // Axis text is not clamped.
+        assert!(f.price_axis.iter().all(|p| matches!(p, Prim::Text { clamp: false, .. })));
     }
 
     #[test]
@@ -1736,13 +1862,14 @@ mod tests {
                 align,
                 color,
                 bg,
+                clamp,
             } = p
             else {
                 panic!()
             };
             assert_eq!(
-                (text.as_str(), *size, *bold, *italic, *align, *color, *bg),
-                (want, 20.0, true, true, TextAlign::Center, 0x123456FF, None)
+                (text.as_str(), *size, *bold, *italic, *align, *color, *bg, *clamp),
+                (want, 20.0, true, true, TextAlign::Center, 0x123456FF, None, true)
             );
             let want_pos = ((pa.0 + pb.0) / 2.0, top + 25.0 * (k as f32 + 0.5));
             assert!(near(*pos, want_pos), "{pos:?} {want_pos:?}");

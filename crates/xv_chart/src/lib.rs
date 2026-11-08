@@ -9,7 +9,7 @@ mod viewport;
 
 pub use colors::ChartColors;
 pub use frame::{
-    AXIS_LABEL_HEIGHT, ChartLayout, DEFAULT_TEXT_SIZE, Dash, Frame, FrameInput, Legend,
+    AXIS_LABEL_HEIGHT, ChartLayout, DEFAULT_TEXT_SIZE, Dash, clamp_span, Frame, FrameInput, Legend,
     PRICE_AXIS_WIDTH, Prim, RectF,
     TIME_AXIS_HEIGHT, TextAlign, build_frame,
 };
