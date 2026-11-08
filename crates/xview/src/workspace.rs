@@ -862,6 +862,7 @@ impl Workspace {
             window: self.window_rect,
             theme: self.theme.mode,
             use_utc: self.use_utc,
+            ..Settings::default()
         }
     }
 

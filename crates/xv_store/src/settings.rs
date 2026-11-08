@@ -18,6 +18,14 @@ pub enum ThemeMode {
     Dark,
 }
 
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum MagnetSetting {
+    #[default]
+    Weak,
+    Strong,
+}
+
 fn default_version() -> u32 {
     1
 }
@@ -40,6 +48,12 @@ pub struct Settings {
     pub theme: ThemeMode,
     #[serde(default)]
     pub use_utc: bool,
+    #[serde(default)]
+    pub magnet_on: bool,
+    #[serde(default)]
+    pub magnet_mode: MagnetSetting,
+    #[serde(default)]
+    pub stay_in_drawing_mode: bool,
 }
 
 impl Default for Settings {
@@ -51,6 +65,9 @@ impl Default for Settings {
             window: None,
             theme: ThemeMode::Light,
             use_utc: false,
+            magnet_on: false,
+            magnet_mode: MagnetSetting::Weak,
+            stay_in_drawing_mode: false,
         }
     }
 }
@@ -105,9 +122,28 @@ mod tests {
             }),
             theme: ThemeMode::Dark,
             use_utc: true,
+            magnet_on: true,
+            magnet_mode: MagnetSetting::Strong,
+            stay_in_drawing_mode: true,
         };
         save_settings(t.path(), &s).unwrap();
         assert_eq!(load_settings(t.path()), s);
+    }
+
+    #[test]
+    fn settings_v1_without_new_fields_loads_defaults() {
+        let t = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            t.path().join("settings.json"),
+            r#"{"version":1,"theme":"Dark","use_utc":true}"#,
+        )
+        .unwrap();
+        let s = load_settings(t.path());
+        assert!(!s.magnet_on);
+        assert_eq!(s.magnet_mode, MagnetSetting::Weak);
+        assert!(!s.stay_in_drawing_mode);
+        assert_eq!(s.theme, ThemeMode::Dark);
+        assert!(s.use_utc);
     }
 
     #[test]
