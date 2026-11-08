@@ -23,6 +23,10 @@
 //!   the name / hex field)
 //! - `pickcolor=RRGGBBAA`: choose a color in the open color picker
 //! - `template=NAME`: save the selected drawing's style as a named template
+//! - `settings`: open the settings dialog for the selected drawing;
+//!   `tab=style|text|coordinates|visibility`; `dialog=ok|cancel`;
+//!   `dlg=color:RRGGBBAA|text:STR|name:STR|price1:STR|time1:STR|vis:ROW:MIN-MAX|pop:NAME`
+//!   (see `DrawingSettings::debug_set`)
 //! - `undo`, `redo`: as cmd-z / cmd-shift-z
 //! - `log`: print the chart state to stderr
 //! - `shot=NAME`: run `$XVIEW_SCRIPT_SHOT NAME` (e.g. a screenshot script)
@@ -146,6 +150,13 @@ fn run(
             Err(_) => eprintln!("xview-script: bad color {arg}"),
         },
         "template" => ws.debug_save_template(arg, window, cx),
+        "settings" => ws.debug_open_settings(window, cx),
+        "tab" => ws.debug_settings(window, cx, |d, window, cx| d.debug_tab(arg, window, cx)),
+        "dialog" => {
+            let ok = arg == "ok";
+            ws.debug_settings(window, cx, |d, _, cx| d.finish(ok, cx));
+        }
+        "dlg" => ws.debug_settings(window, cx, |d, window, cx| d.debug_set(arg, window, cx)),
         "undo" | "redo" => ws.debug_chart(cx, |c, cx| {
             let k = if cmd == "undo" { ChartKey::Undo } else { ChartKey::Redo };
             let fx = c.state.key(k);
@@ -241,7 +252,7 @@ fn run(
                 s.tool,
                 s.selected,
                 s.drawings.undo_depth(),
-                s.drawings.all().iter().map(|d| (&d.kind, format!("{:08X}", d.style.color), format!("{:08X}", d.style.text.color), d.style.width, d.locked)).collect::<Vec<_>>(),
+                s.drawings.all().iter().map(|d| (&d.kind, format!("{:08X}", d.style.color), format!("{:08X}", d.style.text.color), d.style.width, d.locked, &d.style.text.content, &d.name)).collect::<Vec<_>>(),
             );
         }),
         "shot" => {

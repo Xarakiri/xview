@@ -2,7 +2,7 @@
 //! click-away popover layers. XView does not use Zed's `ui` crate.
 
 use gpui::{
-    AnchoredPositionMode, AnyElement, AnyView, App, Context, Div, Hsla, MouseButton,
+    Anchor, AnchoredPositionMode, AnyElement, AnyView, App, Context, Div, Hsla, MouseButton,
     MouseDownEvent, Render, SharedString, Stateful, Svg, Window, anchored, deferred, div, point,
     prelude::*, px, svg,
 };
@@ -176,6 +176,18 @@ pub fn popover_layer(
     on_close: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
     window: &Window,
 ) -> [AnyElement; 2] {
+    popover_layer_at(offset, Anchor::TopLeft, menu, on_close, window)
+}
+
+/// `popover_layer` with the menu's `anchor` corner at `offset` (e.g.
+/// `BottomLeft` to open upwards).
+pub fn popover_layer_at(
+    offset: (f32, f32),
+    anchor: Anchor,
+    menu: impl IntoElement,
+    on_close: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
+    window: &Window,
+) -> [AnyElement; 2] {
     let backdrop = backdrop(on_close, window);
     let menu = div()
         .absolute()
@@ -184,6 +196,7 @@ pub fn popover_layer(
         .child(
             deferred(
                 anchored()
+                    .anchor(anchor)
                     .snap_to_window_with_margin(px(8.))
                     .child(div().occlude().child(menu)),
             )

@@ -21,7 +21,7 @@ use gpui_tokio::Tokio;
 use xv_chart::{ChartEffect, MagnetMode};
 use xv_core::{Series, SourceId, Symbol, SymbolKey, Timeframe, TzOffset};
 use xv_data::{DataError, HistoryPage, LoadGuard, LoadToken, SourceRegistry};
-use xv_drawings::{Drawing, Tool};
+use xv_drawings::{Drawing, DrawingId, Tool};
 use xv_source_binance::BINANCE_SOURCE_ID;
 use xv_source_csv::{CSV_SOURCE_ID, CsvError, CsvLoadReport, CsvSource};
 use xv_store::{
@@ -31,6 +31,7 @@ use xv_store::{
 use crate::bottom_bar::BottomBar;
 use crate::chart_view::{ChartView, ChartViewEvent, CopyDrawing, PasteDrawing};
 use crate::demo;
+use crate::drawing_settings::{DrawingSettings, SettingsEvent};
 use crate::drawing_toolbar::{DrawingToolbar, ToolbarEvent};
 use crate::left_toolbar::LeftToolbar;
 use crate::loader::{BackfillOutcome, Loader};
@@ -213,6 +214,8 @@ pub struct Workspace {
     templates: TemplatesFile,
     /// In-app clipboard (cmd-c / cmd-v), for the current symbol only.
     clipboard: Option<Drawing>,
+    /// The open drawing settings dialog.
+    settings: Option<(Entity<DrawingSettings>, Vec<Subscription>)>,
     bounds_save: Option<Task<()>>,
     resolve: Option<Task<()>>,
     top_bar: Entity<TopBar>,
@@ -508,10 +511,7 @@ impl Workspace {
                         tb.open_context_menu(position, window, cx)
                     });
                 }
-                ChartViewEvent::OpenSettings(id) => {
-                    // The settings dialog comes with Task 7.
-                    eprintln!("xview: open settings for drawing {}", id.0);
-                }
+                ChartViewEvent::OpenSettings(id) => this.open_drawing_settings(*id, window, cx),
                 ChartViewEvent::ToolFinished
                 | ChartViewEvent::SelectionChanged
                 | ChartViewEvent::DismissPopover => {}
@@ -569,6 +569,7 @@ impl Workspace {
             settings_error: None,
             templates,
             clipboard: None,
+            settings: None,
             bounds_save: None,
             resolve: None,
             top_bar,
@@ -913,11 +914,13 @@ impl Workspace {
         if self.drawings_key.as_ref() == Some(&key) {
             return;
         }
-        // An open color picker commits its session into the old symbol's
-        // set while that set is still loaded, and the result is queued under
-        // the old key before the flush (the commit's DrawingsChanged event
-        // would only arrive after the key has moved on).
-        if self.drawing_toolbar.update(cx, |tb, cx| tb.close_popover(cx)) {
+        // An open settings dialog cancels, and an open color picker commits
+        // its session, into the old symbol's set while that set is still
+        // loaded; the result is queued under the old key before the flush
+        // (the DrawingsChanged events would only arrive after the key has
+        // moved on).
+        let closed = self.close_drawing_settings(cx);
+        if self.drawing_toolbar.update(cx, |tb, cx| tb.close_popover(cx)) || closed {
             self.schedule_drawings_save(cx);
         }
         self.flush_drawings(cx);
@@ -1037,7 +1040,58 @@ impl Workspace {
         let f = self.templates.clone();
         self.drawing_toolbar
             .update(cx, |tb, cx| tb.set_templates(&f, cx));
+        if let Some((d, _)) = &self.settings {
+            d.update(cx, |d, cx| d.set_templates(&f, cx));
+        }
         self.schedule_templates_save(cx);
+    }
+
+    // ---- drawing settings dialog ----
+
+    /// Opens the settings dialog for drawing `id` (it must be the selected
+    /// one). Every open path ends here: double-click, the toolbar's Settings
+    /// button, More → Settings… and the context menu's Settings….
+    fn open_drawing_settings(&mut self, id: DrawingId, window: &mut Window, cx: &mut Context<Self>) {
+        if self.settings.is_some() {
+            return;
+        }
+        self.drawing_toolbar.update(cx, |tb, cx| tb.close_popover(cx));
+        let original = self.chart.update(cx, |c, _| {
+            (c.state.selected == Some(id))
+                .then(|| c.state.begin_edit())
+                .flatten()
+        });
+        let Some(original) = original else { return };
+        let (chart, theme) = (self.chart.clone(), self.theme.clone());
+        let templates = self.templates.clone();
+        let dialog = cx.new(|cx| DrawingSettings::new(chart, original, theme, &templates, window, cx));
+        let closed = cx.subscribe_in(&dialog, window, |this, _, _: &SettingsEvent, window, cx| {
+            this.drop_drawing_settings(cx);
+            window.focus(&this.chart.focus_handle(cx), cx);
+        });
+        let templates = cx.subscribe(&dialog, |this, _, e: &ToolbarEvent, cx| this.on_toolbar_event(e, cx));
+        window.focus(&dialog.focus_handle(cx), cx);
+        self.chart.update(cx, |c, _| c.modal_open = true);
+        self.settings = Some((dialog, vec![closed, templates]));
+        cx.notify();
+    }
+
+    fn drop_drawing_settings(&mut self, cx: &mut Context<Self>) {
+        if self.settings.take().is_some() {
+            self.chart.update(cx, |c, _| c.modal_open = false);
+            cx.notify();
+        }
+    }
+
+    /// Cancels and closes an open settings dialog. Returns whether one was
+    /// open. Focus goes back to the chart on the next render.
+    fn close_drawing_settings(&mut self, cx: &mut Context<Self>) -> bool {
+        let Some((d, _)) = &self.settings else {
+            return false;
+        };
+        d.update(cx, |d, cx| d.finish(false, cx));
+        self.drop_drawing_settings(cx);
+        true
     }
 
     fn paste_drawing(&mut self, cx: &mut Context<Self>) {
@@ -1294,6 +1348,24 @@ impl Workspace {
             .update(cx, |tb, cx| tb.debug_save_template(&name, window, cx));
     }
 
+    pub(crate) fn debug_open_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(id) = self.chart.read(cx).state.selected {
+            self.open_drawing_settings(id, window, cx);
+        }
+    }
+
+    pub(crate) fn debug_settings(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        f: impl FnOnce(&mut DrawingSettings, &mut Window, &mut Context<DrawingSettings>),
+    ) {
+        match &self.settings {
+            Some((d, _)) => d.update(cx, |d, cx| f(d, window, cx)),
+            None => eprintln!("xview-script: no settings dialog open"),
+        }
+    }
+
     pub(crate) fn debug_chart(
         &mut self,
         cx: &mut Context<Self>,
@@ -1387,14 +1459,15 @@ impl Render for Workspace {
             .on_action(cx.listener(|this, _: &UnhideAllDrawings, _, cx| {
                 this.with_chart(cx, |s| s.unhide_all())
             }))
-            // cmd-c / cmd-v do nothing while a toolbar popover is open.
+            // cmd-c / cmd-v do nothing while a toolbar popover or the
+            // settings dialog is open.
             .on_action(cx.listener(|this, _: &CopyDrawing, _, cx| {
-                if !this.chart.read(cx).popover_open {
+                if !this.chart.read(cx).input_blocked() {
                     this.copy_drawing(cx)
                 }
             }))
             .on_action(cx.listener(|this, _: &PasteDrawing, _, cx| {
-                if !this.chart.read(cx).popover_open {
+                if !this.chart.read(cx).input_blocked() {
                     this.paste_drawing(cx)
                 }
             }))
@@ -1408,11 +1481,22 @@ impl Render for Workspace {
                     s.check_need_older()
                 })
             }))
+            // The settings dialog is modal: no search, CSV or theme switch.
             .on_action(cx.listener(|this, _: &OpenSymbolSearch, window, cx| {
-                this.open_search(String::new(), window, cx)
+                if this.settings.is_none() {
+                    this.open_search(String::new(), window, cx)
+                }
             }))
-            .on_action(cx.listener(|this, _: &OpenCsv, _, cx| this.open_csv(cx)))
-            .on_action(cx.listener(|this, _: &ToggleTheme, _, cx| this.toggle_theme(cx)))
+            .on_action(cx.listener(|this, _: &OpenCsv, _, cx| {
+                if this.settings.is_none() {
+                    this.open_csv(cx)
+                }
+            }))
+            .on_action(cx.listener(|this, _: &ToggleTheme, _, cx| {
+                if this.settings.is_none() {
+                    this.toggle_theme(cx)
+                }
+            }))
             .on_action(cx.listener(|this, _: &ToggleClockUtc, _, cx| this.toggle_clock_utc(cx)))
             .relative()
             .flex()
@@ -1454,6 +1538,7 @@ impl Render for Workspace {
                     ),
             )
             .children(self.search.as_ref().map(|(search, _)| search.clone()))
+            .children(self.settings.as_ref().map(|(d, _)| d.clone()))
     }
 }
 

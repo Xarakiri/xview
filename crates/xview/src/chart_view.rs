@@ -110,6 +110,9 @@ pub struct ChartView {
     /// A drawing-toolbar popover is open, so Esc closes it (set by the
     /// toolbar).
     pub popover_open: bool,
+    /// The drawing settings dialog is open (set by the workspace): the chart
+    /// takes no shortcuts.
+    pub modal_open: bool,
     /// Element size last passed to `ChartState::set_size`.
     size: Option<(f32, f32)>,
     stats: Option<Rc<RefCell<FrameStats>>>,
@@ -155,6 +158,7 @@ impl ChartView {
             hovered: false,
             origin: Point::default(),
             popover_open: false,
+            modal_open: false,
             size: None,
             stats,
             _activation: activation,
@@ -223,6 +227,12 @@ impl ChartView {
             });
         }
         cx.notify();
+    }
+
+    /// Edit shortcuts are swallowed while a toolbar popover or the settings
+    /// dialog is open.
+    pub fn input_blocked(&self) -> bool {
+        self.popover_open || self.modal_open
     }
 
     /// Window position of the chart element's origin.
@@ -326,11 +336,14 @@ impl Render for ChartView {
             // While a toolbar popover is open, edit shortcuts are swallowed:
             // they would change the drawing under an open picker session.
             .on_action(cx.listener(|this, _: &Delete, _, cx| {
-                if !this.popover_open {
+                if !this.input_blocked() {
                     this.key(ChartKey::Delete, cx)
                 }
             }))
             .on_action(cx.listener(|this, _: &Cancel, _, cx| {
+                if this.modal_open {
+                    return;
+                }
                 if this.popover_open {
                     cx.emit(ChartViewEvent::DismissPopover);
                 } else {
@@ -338,17 +351,17 @@ impl Render for ChartView {
                 }
             }))
             .on_action(cx.listener(|this, _: &Undo, _, cx| {
-                if !this.popover_open {
+                if !this.input_blocked() {
                     this.key(ChartKey::Undo, cx)
                 }
             }))
             .on_action(cx.listener(|this, _: &Redo, _, cx| {
-                if !this.popover_open {
+                if !this.input_blocked() {
                     this.key(ChartKey::Redo, cx)
                 }
             }))
             .on_action(cx.listener(|this, _: &CloneDrawing, _, cx| {
-                if this.popover_open {
+                if this.input_blocked() {
                     return;
                 }
                 let fx = this.state.clone_selected();
@@ -360,7 +373,7 @@ impl Render for ChartView {
                 this.modifiers_changed(&e.modifiers, cx)
             }))
             .on_key_down(cx.listener(|this, e: &KeyDownEvent, _, cx| {
-                if this.popover_open {
+                if this.input_blocked() {
                     return;
                 }
                 if let Some(letter) = type_to_search_letter(&e.keystroke) {

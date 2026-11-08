@@ -146,6 +146,7 @@ impl ColorPicker {
                     this.set_opacity(v.min(100) as u8, false, cx);
                 }
             }
+            TextInputEvent::Step(_) => {}
             TextInputEvent::Submit(_) | TextInputEvent::Cancel => {
                 let p = opacity_pct(this.color).to_string();
                 this.pct.update(cx, |f, cx| f.set_text(p, cx));
@@ -224,6 +225,7 @@ impl ColorPicker {
                 }
             }
             TextInputEvent::Cancel => this.close_hex(cx),
+            TextInputEvent::Step(_) => {}
         });
         window.focus(&input.focus_handle(cx), cx);
         self.hex = Some((input, sub));

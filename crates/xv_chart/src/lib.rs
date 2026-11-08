@@ -19,7 +19,9 @@ pub use snap::{
     snap_ohlc,
 };
 pub use state::{ChartEffect, ChartKey, ChartState, Mods, OLDER_THRESHOLD_BARS};
-pub use ticks::{TimeTick, format_crosshair_time, format_price, price_ticks, time_ticks};
+pub use ticks::{
+    TimeTick, decimals_of, format_crosshair_time, format_price, price_ticks, time_ticks,
+};
 pub use time_index::{index_to_time, time_to_index};
 pub use viewport::{
     AUTOFIT_PAD, DEFAULT_BAR_SPACING, MAX_BAR_SPACING, MIN_BAR_SPACING, PriceRange, PriceScale,

@@ -22,9 +22,10 @@ use xv_store::{NamedTemplate, TemplatesFile};
 use crate::chart_view::{ChartView, ChartViewEvent};
 use crate::color_picker::{ColorPicker, ColorPickerEvent};
 use crate::context_menu::{self, MenuAction};
+use crate::templates_menu::{TemplateHost, apply_template, name_input, template_style, templates_menu};
 use crate::text_input::{TextInput, TextInputEvent};
 use crate::theme::{AppTheme, u32_to_hsla};
-use crate::widgets::{DISABLED_OPACITY, backdrop, icon, menu_box, menu_row, popover_layer, tooltip};
+use crate::widgets::{DISABLED_OPACITY, backdrop, icon, menu_box, popover_layer, tooltip};
 
 const HEIGHT: f32 = 52.;
 const BTN: f32 = 44.;
@@ -39,13 +40,12 @@ const OFFSET: f32 = 8.;
 const MARGIN: f32 = 4.;
 /// Gap between the bar and a popover under it.
 const POPOVER_GAP: f32 = 6.;
-const WIDTHS: [u8; 4] = [1, 2, 3, 4];
-const LINE_STYLES: [(LineStyle, &str); 3] = [
+pub(crate) const WIDTHS: [u8; 4] = [1, 2, 3, 4];
+pub(crate) const LINE_STYLES: [(LineStyle, &str); 3] = [
     (LineStyle::Solid, "Line"),
     (LineStyle::Dashed, "Dashed line"),
     (LineStyle::Dotted, "Dotted line"),
 ];
-const TEMPLATE_NAME_MAX: usize = 40;
 
 /// H-lines and V-lines have no text-color button.
 fn has_text_color(tool: Tool) -> bool {
@@ -83,13 +83,6 @@ pub fn clamp_pos(p: (f32, f32), size: (f32, f32), w: f32) -> (f32, f32) {
 pub fn place(b: RectF, size: (f32, f32), w: f32, offset: (f32, f32)) -> (f32, f32) {
     let (x, y) = position(b, size, w);
     clamp_pos((x + offset.0, y + offset.1), size, w)
-}
-
-/// `d`'s style replaced by `template`, keeping the drawing's text.
-pub fn apply_template(d: &mut Drawing, template: &Style) {
-    let content = std::mem::take(&mut d.style.text.content);
-    d.style = template.clone();
-    d.style.text.content = content;
 }
 
 /// What the toolbar shows of the chart.
@@ -405,21 +398,14 @@ impl DrawingToolbar {
     }
 
     fn open_name_input(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let theme = self.theme.clone();
-        let input = cx.new(|cx| {
-            TextInput::new("", "Template name", |c| !c.is_control(), TEMPLATE_NAME_MAX, theme, cx)
-        });
+        let input = name_input(&self.theme, cx);
         let sub = cx.subscribe_in(&input, window, |this, _, e: &TextInputEvent, window, cx| {
             match e {
                 // Re-render for the Save button's enabled state.
                 TextInputEvent::Changed(_) => cx.notify(),
+                TextInputEvent::Step(_) => {}
                 TextInputEvent::Submit(name) => this.save_template(name.clone(), window, cx),
-                TextInputEvent::Cancel => {
-                    this.name_input = None;
-                    let focus = this.chart.focus_handle(cx);
-                    window.focus(&focus, cx);
-                    cx.notify();
-                }
+                TextInputEvent::Cancel => this.cancel_template_name(window, cx),
             }
         });
         window.focus(&input.focus_handle(cx), cx);
@@ -427,19 +413,16 @@ impl DrawingToolbar {
         cx.notify();
     }
 
-    fn save_template(&mut self, name: String, window: &mut Window, cx: &mut Context<Self>) {
+    fn do_save_template(&mut self, name: String, window: &mut Window, cx: &mut Context<Self>) {
         let name = name.trim().to_string();
         let Some(s) = &self.snap else { return };
         if name.is_empty() {
             return;
         }
-        let mut style = s.style.clone();
-        // Templates carry the look, not the words.
-        style.text.content.clear();
         cx.emit(ToolbarEvent::SaveTemplate {
             tool: s.tool,
             name,
-            style,
+            style: template_style(&s.style),
         });
         self.set_open(None, Some(window), cx);
     }
@@ -523,103 +506,13 @@ impl DrawingToolbar {
         }
     }
 
-    fn templates_menu(&self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
-        let _ = window;
-        let t = &self.theme;
+    fn templates_menu(&self, _: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let Some(s) = &self.snap else {
             return div().into_any_element();
         };
-        let tool = s.tool;
-        let mut menu = menu_box(t).min_w(px(260.)).child(
-            menu_row("tpl-save", None, "Save Drawing Template As…", false, true, t)
-                .text_size(px(15.))
-                .on_click(cx.listener(|this, _, window, cx| {
-                    if this.name_input.is_none() {
-                        this.open_name_input(window, cx);
-                    }
-                })),
-        );
-        if let Some((input, _)) = &self.name_input {
-            let input = input.clone();
-            let save_input = input.clone();
-            let can_save = !input.read(cx).text().trim().is_empty();
-            menu = menu.child(
-                div()
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap(px(6.))
-                    .px(px(12.))
-                    .py(px(4.))
-                    .child(div().flex_1().child(input))
-                    .child(
-                        small_button("tpl-name-save", "Save", true, t)
-                            .when(!can_save, |b| b.opacity(DISABLED_OPACITY))
-                            .when(can_save, |b| {
-                                b.on_click(cx.listener(move |this, _, window, cx| {
-                                    let name = save_input.read(cx).text().to_string();
-                                    this.save_template(name, window, cx);
-                                }))
-                            }),
-                    )
-                    .child(small_button("tpl-name-cancel", "Cancel", false, t).on_click(
-                        cx.listener(|this, _, window, cx| {
-                            this.name_input = None;
-                            let focus = this.chart.focus_handle(cx);
-                            window.focus(&focus, cx);
-                            cx.notify();
-                        }),
-                    )),
-            );
-        }
-        menu = menu.child(
-            menu_row("tpl-default", None, "Apply Default Drawing Template", false, true, t)
-                .text_size(px(15.))
-                .on_click(cx.listener(move |this, _, window, cx| {
-                    this.apply_style(tool.default_style(), window, cx)
-                })),
-        );
-        let named = self.named.get(tool.key()).cloned().unwrap_or_default();
-        if !named.is_empty() {
-            menu = menu.child(div().h(px(1.)).mx(px(8.)).my(px(4.)).bg(t.border));
-        }
-        for (i, nt) in named.into_iter().enumerate() {
-            let group = SharedString::from(format!("tpl-row-{i}"));
-            let name = nt.name.clone();
-            let style = nt.style.clone();
-            let hover = t.hover;
-            menu = menu.child(
-                menu_row(group.clone(), None, nt.name.clone(), false, true, t)
-                    .group(group.clone())
-                    .text_size(px(15.))
-                    .child(div().flex_1().min_w(px(16.)))
-                    .child(
-                        div()
-                            .id(SharedString::from(format!("tpl-del-{i}")))
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .size(px(24.))
-                            .rounded(px(4.))
-                            .text_color(t.muted)
-                            .invisible()
-                            .group_hover(group, |s| s.visible())
-                            .hover(move |s| s.bg(hover))
-                            .child("✕")
-                            .on_click(cx.listener(move |_, _, _, cx| {
-                                cx.stop_propagation();
-                                cx.emit(ToolbarEvent::DeleteTemplate {
-                                    tool,
-                                    name: name.clone(),
-                                });
-                            })),
-                    )
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        this.apply_style(style.clone(), window, cx)
-                    })),
-            );
-        }
-        menu.into_any_element()
+        let named = self.named.get(s.tool.key()).cloned().unwrap_or_default();
+        let input = self.name_input.as_ref().map(|(i, _)| i.clone());
+        templates_menu(s.tool, &named, input.as_ref(), &self.theme, cx).into_any_element()
     }
 
     fn width_menu(&self, _: &mut Window, cx: &mut Context<Self>) -> AnyElement {
@@ -940,12 +833,12 @@ impl DrawingToolbar {
     /// Saves the current style as a named template.
     #[cfg(debug_assertions)]
     pub fn debug_save_template(&mut self, name: &str, window: &mut Window, cx: &mut Context<Self>) {
-        self.save_template(name.to_string(), window, cx);
+        self.do_save_template(name.to_string(), window, cx);
     }
 }
 
 /// A row of the width / line-style menus; the current one is inverted.
-fn pick_row(id: SharedString, active: bool, t: &AppTheme) -> Stateful<Div> {
+pub(crate) fn pick_row(id: SharedString, active: bool, t: &AppTheme) -> Stateful<Div> {
     let hover = t.hover;
     div()
         .id(id)
@@ -961,7 +854,7 @@ fn pick_row(id: SharedString, active: bool, t: &AppTheme) -> Stateful<Div> {
 }
 
 /// A short horizontal sample of a line style.
-fn line_sample(ls: LineStyle, h: f32, color: Hsla) -> Div {
+pub(crate) fn line_sample(ls: LineStyle, h: f32, color: Hsla) -> Div {
     let seg = |w: f32| div().flex_none().w(px(w)).h(px(h)).bg(color);
     let row = div().flex().flex_row().items_center().w(px(22.));
     match ls {
@@ -973,24 +866,33 @@ fn line_sample(ls: LineStyle, h: f32, color: Hsla) -> Div {
     }
 }
 
-fn small_button(id: &'static str, label: &'static str, primary: bool, t: &AppTheme) -> Stateful<Div> {
-    let hover = t.hover;
-    div()
-        .id(id)
-        .flex()
-        .flex_none()
-        .items_center()
-        .h(px(30.))
-        .px(px(10.))
-        .rounded(px(6.))
-        .text_size(px(13.))
-        .when(primary, |d| d.bg(t.text).text_color(t.bg))
-        .when(!primary, |d| {
-            d.border_1()
-                .border_color(t.border)
-                .hover(move |s| s.bg(hover))
-        })
-        .child(label)
+impl TemplateHost for DrawingToolbar {
+    fn open_template_name(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.name_input.is_none() {
+            self.open_name_input(window, cx);
+        }
+    }
+
+    fn save_template(&mut self, name: String, window: &mut Window, cx: &mut Context<Self>) {
+        self.do_save_template(name, window, cx);
+    }
+
+    fn cancel_template_name(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.name_input = None;
+        let focus = self.chart.focus_handle(cx);
+        window.focus(&focus, cx);
+        cx.notify();
+    }
+
+    fn apply_template_style(&mut self, style: Style, window: &mut Window, cx: &mut Context<Self>) {
+        self.apply_style(style, window, cx);
+    }
+
+    fn delete_template(&mut self, name: String, cx: &mut Context<Self>) {
+        if let Some(s) = &self.snap {
+            cx.emit(ToolbarEvent::DeleteTemplate { tool: s.tool, name });
+        }
+    }
 }
 
 impl Render for DrawingToolbar {
@@ -1051,31 +953,4 @@ mod tests {
         assert_eq!(toolbar_width(true) - toolbar_width(false), BTN);
     }
 
-    #[test]
-    fn template_keeps_text_content() {
-        use xv_drawings::{Anchor, DrawingKind};
-        let a = Anchor {
-            time_ms: 0,
-            price: 1.0,
-        };
-        let mut d = Drawing {
-            id: DrawingId(1),
-            kind: DrawingKind::TrendLine { a, b: a },
-            style: Style::default(),
-            name: None,
-            locked: false,
-            hidden: false,
-        };
-        d.style.text.content = "keep me".into();
-        let mut tpl = Style {
-            width: 4,
-            color: 0x112233FF,
-            ..Style::default()
-        };
-        tpl.text.content = "template words".into();
-        apply_template(&mut d, &tpl);
-        assert_eq!(d.style.width, 4);
-        assert_eq!(d.style.color, 0x112233FF);
-        assert_eq!(d.style.text.content, "keep me");
-    }
 }
