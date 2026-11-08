@@ -913,6 +913,13 @@ impl Workspace {
         if self.drawings_key.as_ref() == Some(&key) {
             return;
         }
+        // An open color picker commits its session into the old symbol's
+        // set while that set is still loaded, and the result is queued under
+        // the old key before the flush (the commit's DrawingsChanged event
+        // would only arrive after the key has moved on).
+        if self.drawing_toolbar.update(cx, |tb, cx| tb.close_popover(cx)) {
+            self.schedule_drawings_save(cx);
+        }
         self.flush_drawings(cx);
         let ds = match self.persistence.load_drawings(&key) {
             LoadedDrawings::Ok(ds) => ds,
@@ -1380,8 +1387,17 @@ impl Render for Workspace {
             .on_action(cx.listener(|this, _: &UnhideAllDrawings, _, cx| {
                 this.with_chart(cx, |s| s.unhide_all())
             }))
-            .on_action(cx.listener(|this, _: &CopyDrawing, _, cx| this.copy_drawing(cx)))
-            .on_action(cx.listener(|this, _: &PasteDrawing, _, cx| this.paste_drawing(cx)))
+            // cmd-c / cmd-v do nothing while a toolbar popover is open.
+            .on_action(cx.listener(|this, _: &CopyDrawing, _, cx| {
+                if !this.chart.read(cx).popover_open {
+                    this.copy_drawing(cx)
+                }
+            }))
+            .on_action(cx.listener(|this, _: &PasteDrawing, _, cx| {
+                if !this.chart.read(cx).popover_open {
+                    this.paste_drawing(cx)
+                }
+            }))
             .on_action(
                 cx.listener(|this, _: &ClearDrawings, window, cx| this.clear_drawings(window, cx)),
             )

@@ -85,6 +85,8 @@ pub struct TextInput {
     max_len: usize,
     /// Shown right after the text, e.g. "%".
     suffix: Option<SharedString>,
+    /// Draws a red border (the owner validates).
+    invalid: bool,
 }
 
 impl EventEmitter<TextInputEvent> for TextInput {}
@@ -112,6 +114,7 @@ impl TextInput {
             accept,
             max_len,
             suffix: None,
+            invalid: false,
         }
     }
 
@@ -129,6 +132,13 @@ impl TextInput {
         let text = text.into();
         if text != self.text {
             self.text = text;
+            cx.notify();
+        }
+    }
+
+    pub fn set_invalid(&mut self, invalid: bool, cx: &mut Context<Self>) {
+        if invalid != self.invalid {
+            self.invalid = invalid;
             cx.notify();
         }
     }
@@ -189,7 +199,13 @@ impl Render for TextInput {
             .px(px(8.))
             .rounded(px(6.))
             .border_1()
-            .border_color(if focused { t.accent } else { t.border })
+            .border_color(if self.invalid {
+                t.badge
+            } else if focused {
+                t.accent
+            } else {
+                t.border
+            })
             .bg(t.bg)
             .text_color(t.text)
             .text_size(px(14.))

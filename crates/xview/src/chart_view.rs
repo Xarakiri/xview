@@ -323,7 +323,13 @@ impl Render for ChartView {
         div()
             .key_context(KEY_CONTEXT)
             .track_focus(&self.focus)
-            .on_action(cx.listener(|this, _: &Delete, _, cx| this.key(ChartKey::Delete, cx)))
+            // While a toolbar popover is open, edit shortcuts are swallowed:
+            // they would change the drawing under an open picker session.
+            .on_action(cx.listener(|this, _: &Delete, _, cx| {
+                if !this.popover_open {
+                    this.key(ChartKey::Delete, cx)
+                }
+            }))
             .on_action(cx.listener(|this, _: &Cancel, _, cx| {
                 if this.popover_open {
                     cx.emit(ChartViewEvent::DismissPopover);
@@ -331,9 +337,20 @@ impl Render for ChartView {
                     this.key(ChartKey::Escape, cx)
                 }
             }))
-            .on_action(cx.listener(|this, _: &Undo, _, cx| this.key(ChartKey::Undo, cx)))
-            .on_action(cx.listener(|this, _: &Redo, _, cx| this.key(ChartKey::Redo, cx)))
+            .on_action(cx.listener(|this, _: &Undo, _, cx| {
+                if !this.popover_open {
+                    this.key(ChartKey::Undo, cx)
+                }
+            }))
+            .on_action(cx.listener(|this, _: &Redo, _, cx| {
+                if !this.popover_open {
+                    this.key(ChartKey::Redo, cx)
+                }
+            }))
             .on_action(cx.listener(|this, _: &CloneDrawing, _, cx| {
+                if this.popover_open {
+                    return;
+                }
                 let fx = this.state.clone_selected();
                 this.apply_effects(fx, cx);
             }))
@@ -342,7 +359,10 @@ impl Render for ChartView {
             .on_modifiers_changed(cx.listener(|this, e: &ModifiersChangedEvent, _, cx| {
                 this.modifiers_changed(&e.modifiers, cx)
             }))
-            .on_key_down(cx.listener(|_, e: &KeyDownEvent, _, cx| {
+            .on_key_down(cx.listener(|this, e: &KeyDownEvent, _, cx| {
+                if this.popover_open {
+                    return;
+                }
                 if let Some(letter) = type_to_search_letter(&e.keystroke) {
                     cx.stop_propagation();
                     cx.emit(ChartViewEvent::TypeToSearch(letter));

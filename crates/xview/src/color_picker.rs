@@ -21,12 +21,13 @@ use crate::theme::{AppTheme, u32_to_hsla};
 use crate::widgets::icon;
 
 /// XView's ten base hues (0xRRGGBB), left to right: red, orange, yellow,
-/// green, teal, cyan, blue, violet, purple, pink.
+/// green, teal, cyan, blue, violet, purple, pink. The blue is the default
+/// line color (`PALETTE[0]`), so new drawings show a selected swatch.
 pub const HUES: [u32; 10] = [
-    0xE0443E, 0xF08C2E, 0xF5D63D, 0x4BAE5E, 0x2E9E8F, 0x3BB5D6, 0x3D6EF2, 0x6A4FD8, 0xA347C2,
+    0xE0443E, 0xF08C2E, 0xF5D63D, 0x4BAE5E, 0x2E9E8F, 0x3BB5D6, 0x3B6FE8, 0x6A4FD8, 0xA347C2,
     0xE04382,
 ];
-/// Row 1, white to black (0xRRGGBB).
+/// Row 1, white to black (0xRRGGBB). 0x1A1A1A is the default text color.
 const GRAYS: [u32; 10] = [
     0xFFFFFF, 0xDCDCDC, 0xBBBBBB, 0x9C9C9C, 0x808080, 0x646464, 0x494949, 0x303030, 0x1A1A1A,
     0x000000,
@@ -208,7 +209,13 @@ impl ColorPicker {
             TextInput::new(start, "#RRGGBB", |c| c == '#' || c.is_ascii_hexdigit(), 7, theme, cx)
         });
         let sub = cx.subscribe(&input, |this, _, e: &TextInputEvent, cx| match e {
-            TextInputEvent::Changed(_) => cx.notify(),
+            TextInputEvent::Changed(t) => {
+                let bad = parse_hex(t).is_none();
+                if let Some((input, _)) = &this.hex {
+                    input.update(cx, |f, cx| f.set_invalid(bad, cx));
+                }
+                cx.notify();
+            }
             TextInputEvent::Submit(t) => {
                 if let Some(rgb) = parse_hex(t) {
                     this.pick(rgb, cx);
@@ -244,9 +251,14 @@ impl ColorPicker {
         self.pct.update(cx, |f, cx| f.set_text(p, cx));
     }
 
-    fn swatch(&self, id: SharedString, color: u32, cx: &mut Context<Self>) -> impl IntoElement {
+    fn swatch(
+        &self,
+        id: SharedString,
+        color: u32,
+        selected: bool,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         let t = &self.theme;
-        let selected = color >> 8 == self.color >> 8;
         let light = color >> 8 == 0xFFFFFF;
         let rgb = color >> 8;
         div()
@@ -382,13 +394,25 @@ impl Render for ColorPicker {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let t = self.theme.clone();
         let grid = palette();
+        let cur = self.color >> 8;
+        let in_grid = grid.iter().flatten().any(|c| c >> 8 == cur);
+        let in_custom = self.custom.iter().any(|c| c >> 8 == cur);
+        // Only the first matching swatch gets the ring.
+        let mut ringed = false;
+        let mut ring = |c: u32| {
+            let hit = !ringed && c >> 8 == cur;
+            ringed |= hit;
+            hit
+        };
         let mut rows = div().flex().flex_col().gap(px(GAP));
         for (r, row) in grid.iter().enumerate() {
             let mut line = div().flex().flex_row().gap(px(GAP));
             for (c, &color) in row.iter().enumerate() {
+                let sel = ring(color);
                 line = line.child(self.swatch(
                     SharedString::from(format!("swatch-{r}-{c}")),
                     color,
+                    sel,
                     cx,
                 ));
             }
@@ -401,8 +425,16 @@ impl Render for ColorPicker {
             .flex_wrap()
             .items_center()
             .gap(px(GAP));
+        if !in_grid && !in_custom {
+            // The current color is in neither list: show it, selected.
+            let c = (cur << 8) | 0xFF;
+            let sel = ring(c);
+            custom = custom.child(self.swatch("custom-current".into(), c, sel, cx));
+        }
         for (i, &c) in self.custom.iter().enumerate() {
-            custom = custom.child(self.swatch(SharedString::from(format!("custom-{i}")), c, cx));
+            let sel = ring(c);
+            custom =
+                custom.child(self.swatch(SharedString::from(format!("custom-{i}")), c, sel, cx));
         }
         let hover = t.hover;
         custom = custom.child(
@@ -481,11 +513,13 @@ mod tests {
         let set: std::collections::HashSet<u32> = all.iter().copied().collect();
         assert_eq!(set.len(), 80, "duplicate swatches");
         assert!(all.iter().all(|c| c & 0xFF == 0xFF), "swatches are opaque");
-        // XView's own hues: none of the well-known third-party values, and
-        // not the M1 default drawing color.
-        for banned in [0x2962FF, 0xF23645, 0x089981, xv_drawings::PALETTE[0] >> 8] {
+        // XView's own hues: none of the well-known third-party values.
+        for banned in [0x2962FF, 0xF23645, 0x089981] {
             assert!(!all.contains(&((banned << 8) | 0xFF)), "{banned:06X}");
         }
+        // The default line and text colors are selectable swatches.
+        assert!(all.contains(&(xv_drawings::PALETTE[0] | 0xFF)));
+        assert!(all.contains(&(xv_drawings::TEXT_COLOR | 0xFF)));
         let p = palette();
         assert_eq!(p[0][0], 0xFFFFFFFF);
         assert_eq!(p[0][9], 0x000000FF);

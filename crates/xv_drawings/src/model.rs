@@ -70,7 +70,7 @@ simple_enum!(VAlign { Top, Middle, Bottom } default Top);
 simple_enum!(HAlign { Left, Center, Right } default Right);
 
 /// XView's own dark gray for drawing text.
-pub const TEXT_COLOR: u32 = 0x1F2328FF;
+pub const TEXT_COLOR: u32 = 0x1A1A1AFF;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -304,6 +304,8 @@ mod tests {
         assert_eq!(s.fill, None);
         assert_eq!(s.text.size, 14);
         assert_eq!(s.text.color, TEXT_COLOR);
+        // A gray of the color picker's top row, so it shows as selected.
+        assert_eq!(TEXT_COLOR, 0x1A1A1AFF);
         assert_eq!((s.text.valign, s.text.halign), (VAlign::Top, HAlign::Right));
         assert_eq!(s.stats_pos, StatsPos::Right);
     }

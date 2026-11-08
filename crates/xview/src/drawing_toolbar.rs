@@ -120,6 +120,25 @@ impl Snap {
         })
     }
 
+    /// True when `chart` shows exactly this snapshot (no clone).
+    fn matches(this: &Option<Self>, chart: &ChartView) -> bool {
+        let s = &chart.state;
+        let cur = s.selected_screen_bounds().zip(s.selected_drawing());
+        match (this, cur) {
+            (None, None) => true,
+            (Some(a), Some((bounds, d))) => {
+                let l = &s.layout;
+                a.id == d.id
+                    && a.bounds == bounds
+                    && a.locked == d.locked
+                    && a.style == d.style
+                    && a.tool == tool_of(d)
+                    && a.size == (l.plot.w + l.price_axis.w, l.plot.h + l.time_axis.h)
+            }
+            _ => false,
+        }
+    }
+
     fn width(&self) -> f32 {
         toolbar_width(has_text_color(self.tool))
     }
@@ -193,10 +212,11 @@ impl DrawingToolbar {
     ) -> Self {
         // Chart notifies on every mouse move; only re-render on a change.
         let observe = cx.observe(&chart, |this, chart, cx| {
-            let snap = Snap::of(chart.read(cx));
-            if snap == this.snap {
+            // Compared in place; only a change clones the style.
+            if Snap::matches(&this.snap, chart.read(cx)) {
                 return;
             }
+            let snap = Snap::of(chart.read(cx));
             let (old, new) = (this.snap.as_ref().map(|s| s.id), snap.as_ref().map(|s| s.id));
             this.snap = snap;
             if old != new {
@@ -250,6 +270,14 @@ impl DrawingToolbar {
             p.view.update(cx, |v, cx| v.set_custom(custom, cx));
         }
         cx.notify();
+    }
+
+    /// Closes any popover; an open color picker commits its session. Returns
+    /// whether a picker session was committed.
+    pub fn close_popover(&mut self, cx: &mut Context<Self>) -> bool {
+        let had_picker = self.picker.is_some();
+        self.set_open(None, None, cx);
+        had_picker
     }
 
     /// Opens the right-click menu at `position` (window coordinates).
@@ -383,7 +411,8 @@ impl DrawingToolbar {
         });
         let sub = cx.subscribe_in(&input, window, |this, _, e: &TextInputEvent, window, cx| {
             match e {
-                TextInputEvent::Changed(_) => {}
+                // Re-render for the Save button's enabled state.
+                TextInputEvent::Changed(_) => cx.notify(),
                 TextInputEvent::Submit(name) => this.save_template(name.clone(), window, cx),
                 TextInputEvent::Cancel => {
                     this.name_input = None;
@@ -513,6 +542,7 @@ impl DrawingToolbar {
         if let Some((input, _)) = &self.name_input {
             let input = input.clone();
             let save_input = input.clone();
+            let can_save = !input.read(cx).text().trim().is_empty();
             menu = menu.child(
                 div()
                     .flex()
@@ -523,12 +553,14 @@ impl DrawingToolbar {
                     .py(px(4.))
                     .child(div().flex_1().child(input))
                     .child(
-                        small_button("tpl-name-save", "Save", true, t).on_click(cx.listener(
-                            move |this, _, window, cx| {
-                                let name = save_input.read(cx).text().to_string();
-                                this.save_template(name, window, cx);
-                            },
-                        )),
+                        small_button("tpl-name-save", "Save", true, t)
+                            .when(!can_save, |b| b.opacity(DISABLED_OPACITY))
+                            .when(can_save, |b| {
+                                b.on_click(cx.listener(move |this, _, window, cx| {
+                                    let name = save_input.read(cx).text().to_string();
+                                    this.save_template(name, window, cx);
+                                }))
+                            }),
                     )
                     .child(small_button("tpl-name-cancel", "Cancel", false, t).on_click(
                         cx.listener(|this, _, window, cx| {
