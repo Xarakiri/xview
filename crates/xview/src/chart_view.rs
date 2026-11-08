@@ -10,14 +10,14 @@ use std::{
 
 use gpui::{
     App, Bounds, ContentMask, Context, DispatchPhase, EventEmitter, FocusHandle, Focusable, Font,
-    FontWeight, Hitbox, HitboxBehavior, Hsla, KeyBinding, KeyDownEvent, Keystroke, Modifiers, MouseButton, MouseDownEvent,
+    FontStyle, FontWeight, Hitbox, HitboxBehavior, Hsla, KeyBinding, KeyDownEvent, Keystroke, Modifiers, MouseButton, MouseDownEvent,
     MouseExitEvent, MouseMoveEvent, MouseUpEvent, PathBuilder, PinchEvent, Pixels, Point, Render,
     ScrollDelta, ScrollEvent, SharedString, Subscription, TextRun, Window, actions, canvas, div,
     fill, point, prelude::*, px, quad, size, transparent_black,
 };
 use xv_chart::{
-    ChartColors, ChartEffect, ChartKey, ChartLayout, ChartState, Frame, Legend, MagnetMode, Mods,
-    Prim, RectF, TextAlign,
+    ChartColors, ChartEffect, ChartKey, ChartLayout, ChartState, DEFAULT_TEXT_SIZE, Dash, Frame,
+    Legend, MagnetMode, Mods, Prim, RectF, TextAlign,
 };
 use xv_core::{Candle, Series};
 
@@ -30,7 +30,7 @@ pub const KEY_CONTEXT: &str = "ChartView";
 
 /// Pixels per line for `ScrollDelta::Lines` (mouse wheels).
 const LINE_SCROLL_PX: f32 = 20.0;
-const AXIS_FONT_SIZE: f32 = 12.0;
+const AXIS_FONT_SIZE: f32 = DEFAULT_TEXT_SIZE;
 const TITLE_FONT_SIZE: f32 = 14.0;
 /// Line box used to vertically center axis text on its anchor.
 const TEXT_LINE_HEIGHT: f32 = 16.0;
@@ -41,6 +41,7 @@ const LABEL_RADIUS: f32 = 3.0;
 const HANDLE_RADIUS: f32 = 4.5;
 const HANDLE_BORDER: f32 = 1.5;
 const DASH: [f32; 2] = [4.0, 4.0];
+const DOT: [f32; 2] = [1.0, 3.0];
 const LEGEND_X: f32 = 10.0;
 const LEGEND_Y: f32 = 16.0;
 const LEGEND_GAP: f32 = 12.0;
@@ -345,7 +346,7 @@ fn paint_frame(bounds: Bounds<Pixels>, p: &Prepared, window: &mut Window, cx: &m
         (px_, py_ + l.time_axis.h),
         sep,
         1.0,
-        false,
+        Dash::Solid,
         window,
     );
     painter.line(
@@ -353,7 +354,7 @@ fn paint_frame(bounds: Bounds<Pixels>, p: &Prepared, window: &mut Window, cx: &m
         (px_ + l.price_axis.w, py_),
         sep,
         1.0,
-        false,
+        Dash::Solid,
         window,
     );
 
@@ -374,6 +375,13 @@ fn paint_frame(bounds: Bounds<Pixels>, p: &Prepared, window: &mut Window, cx: &m
     window.with_content_mask(plot_mask, |window| {
         painter.legend(&p.frame.legend, l.plot, c, window, cx);
     });
+}
+
+/// Color, font and size of one `Prim::Text`.
+struct TextLook<'a> {
+    color: Hsla,
+    font: &'a Font,
+    size: f32,
 }
 
 struct Painter {
@@ -435,26 +443,58 @@ impl Painter {
                 b,
                 color,
                 width,
-                dashed,
-            } => self.line(*a, *b, u32_to_hsla(*color), *width, *dashed, window),
+                dash,
+            } => self.line(*a, *b, u32_to_hsla(*color), *width, *dash, window),
             Prim::Text {
                 pos,
                 text,
                 color,
                 align,
                 bg,
+                size,
+                bold,
+                italic,
             } => {
+                let mut font = self.font.clone();
+                if *bold {
+                    font.weight = FontWeight::SEMIBOLD;
+                }
+                if *italic {
+                    font.style = FontStyle::Italic;
+                }
                 self.text(
                     *pos,
                     text,
-                    u32_to_hsla(*color),
+                    TextLook {
+                        color: u32_to_hsla(*color),
+                        font: &font,
+                        size: *size,
+                    },
                     *align,
                     bg.map(u32_to_hsla),
                     window,
                     cx,
                 );
             }
-            Prim::Handle { center, color } => {
+            Prim::Polygon { pts, color } => {
+                let Some((first, rest)) = pts.split_first() else {
+                    return;
+                };
+                let mut p = PathBuilder::fill();
+                p.move_to(self.at(*first));
+                for q in rest {
+                    p.line_to(self.at(*q));
+                }
+                p.close();
+                if let Ok(path) = p.build() {
+                    window.paint_path(path, u32_to_hsla(*color));
+                }
+            }
+            Prim::Handle {
+                center,
+                color,
+                filled,
+            } => {
                 let r = HANDLE_RADIUS;
                 window.paint_quad(quad(
                     Bounds {
@@ -462,8 +502,13 @@ impl Painter {
                         size: size(px(2. * r), px(2. * r)),
                     },
                     px(r),
-                    // Hollow handle: chart background inside, colored ring.
-                    self.background,
+                    // Chart background inside a colored ring; a locked
+                    // drawing's handles are just the ring.
+                    if *filled {
+                        self.background
+                    } else {
+                        transparent_black()
+                    },
                     px(HANDLE_BORDER),
                     u32_to_hsla(*color),
                     Default::default(),
@@ -478,13 +523,13 @@ impl Painter {
         b: (f32, f32),
         color: Hsla,
         width: f32,
-        dashed: bool,
+        dash: Dash,
         window: &mut Window,
     ) {
         let (mut a, mut b) = (a, b);
         let vertical = a.0 == b.0;
         let horizontal = a.1 == b.1;
-        if !dashed && (vertical || horizontal) {
+        if dash == Dash::Solid && (vertical || horizontal) {
             // Axis-aligned solid lines are quads: crisp and far cheaper than
             // tessellated paths (every candle wick takes this path).
             let (c, w) = self.snap_line(if vertical { a.0 } else { a.1 }, width);
@@ -506,8 +551,10 @@ impl Painter {
             (a.1, b.1) = (c, c);
         }
         let mut builder = PathBuilder::stroke(px(width));
-        if dashed {
-            builder = builder.dash_array(&[px(DASH[0]), px(DASH[1])]);
+        match dash {
+            Dash::Solid => {}
+            Dash::Dashed => builder = builder.dash_array(&[px(DASH[0]), px(DASH[1])]),
+            Dash::Dotted => builder = builder.dash_array(&[px(DOT[0]), px(DOT[1])]),
         }
         builder.move_to(self.at(a));
         builder.line_to(self.at(b));
@@ -548,7 +595,7 @@ impl Painter {
         &self,
         pos: (f32, f32),
         text: &str,
-        color: Hsla,
+        look: TextLook,
         align: TextAlign,
         bg: Option<Hsla>,
         window: &mut Window,
@@ -557,13 +604,8 @@ impl Painter {
         if text.is_empty() {
             return;
         }
-        let line = self.shape(
-            text,
-            &self.font,
-            AXIS_FONT_SIZE,
-            &[(text.len(), color)],
-            window,
-        );
+        let line = self.shape(text, look.font, look.size, &[(text.len(), look.color)], window);
+        let line_h = TEXT_LINE_HEIGHT.max(look.size * 1.25);
         let w = f32::from(line.width());
         let x = match align {
             TextAlign::Left => pos.0,
@@ -581,8 +623,8 @@ impl Painter {
             );
         }
         let _ = line.paint(
-            self.at((x, pos.1 - TEXT_LINE_HEIGHT / 2.0)),
-            px(TEXT_LINE_HEIGHT),
+            self.at((x, pos.1 - line_h / 2.0)),
+            px(line_h),
             gpui::TextAlign::Left,
             None,
             window,
