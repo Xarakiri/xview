@@ -116,8 +116,9 @@ pub struct ChartState {
     last_mods: Mods,
     /// Last pointer position (element space), for `modifiers_changed`.
     last_pointer: Option<(f32, f32)>,
-    /// `tool_styles` at `begin_edit`, restored by `cancel_edit`.
-    edit_styles: Option<HashMap<Tool, Style>>,
+    /// The edited drawing's `tool_styles` entries at `begin_edit`, restored
+    /// by `cancel_edit`.
+    edit_styles: Option<Vec<(Tool, Option<Style>)>>,
 }
 
 fn contains(r: &RectF, p: (f32, f32)) -> bool {
@@ -553,13 +554,13 @@ impl ChartState {
 
     /// Selects the topmost drawing under `p` (element space), or deselects.
     /// For the context menu.
-    pub fn select_at(&mut self, p: (f32, f32)) -> Option<DrawingId> {
+    pub fn select_at(&mut self, p: (f32, f32)) -> (Option<DrawingId>, Vec<ChartEffect>) {
         let id = contains(&self.layout.plot, p)
             .then(|| self.hit(p).map(|(id, _)| id))
             .flatten();
         let mut fx = Vec::new();
         self.select(id, &mut fx);
-        id
+        (id, fx)
     }
 
     /// Edits the selected drawing as one undo step (the id cannot change).
@@ -584,7 +585,18 @@ impl ChartState {
     /// Starts no gesture; pass the result back to `commit_edit`/`cancel_edit`.
     pub fn begin_edit(&mut self) -> Option<Drawing> {
         let d = self.selected_drawing()?.clone();
-        self.edit_styles = Some(self.tool_styles.clone());
+        // A dialog edit can turn a trend line into an extended line (and
+        // back), so both entries of a trend line are kept.
+        let tools = match tool_of(&d) {
+            Tool::TrendLine | Tool::ExtendedLine => vec![Tool::TrendLine, Tool::ExtendedLine],
+            t => vec![t],
+        };
+        self.edit_styles = Some(
+            tools
+                .into_iter()
+                .map(|t| (t, self.tool_styles.get(&t).cloned()))
+                .collect(),
+        );
         Some(d)
     }
 
@@ -630,10 +642,17 @@ impl ChartState {
             self.drawings.restore_without_undo(original);
             fx.push(ChartEffect::DrawingsChanged);
         }
-        if let Some(saved) = self.edit_styles.take()
-            && saved != self.tool_styles
-        {
-            self.tool_styles = saved;
+        let mut changed = false;
+        for (tool, saved) in self.edit_styles.take().unwrap_or_default() {
+            if self.tool_styles.get(&tool) != saved.as_ref() {
+                match saved {
+                    Some(st) => self.tool_styles.insert(tool, st),
+                    None => self.tool_styles.remove(&tool),
+                };
+                changed = true;
+            }
+        }
+        if changed {
             fx.push(ChartEffect::ToolStylesChanged);
         }
         fx
@@ -648,7 +667,8 @@ impl ChartState {
         self.insert_and_select(&shifted)
     }
 
-    /// Inserts a copy of `d` (same anchors, new id) and selects it.
+    /// Inserts a copy of `d` (same anchors, new id) and selects it when it is
+    /// shown on this timeframe.
     pub fn paste(&mut self, d: &Drawing) -> Vec<ChartEffect> {
         self.insert_and_select(d)
     }
@@ -658,8 +678,9 @@ impl ChartState {
             return Vec::new();
         };
         let mut fx = vec![ChartEffect::DrawingsChanged];
-        self.select(Some(id), &mut fx);
-        self.drop_invisible_selection(&mut fx);
+        if self.drawings.get(id).is_some_and(|c| self.is_shown(c)) {
+            self.select(Some(id), &mut fx);
+        }
         fx
     }
 
@@ -2092,7 +2113,7 @@ mod tests {
         set_flags(&mut s, id, |d| d.hidden = true);
         click(&mut s, (300.0, 125.0), no());
         assert_eq!(s.selected, None);
-        assert_eq!(s.select_at((300.0, 125.0)), None);
+        assert_eq!(s.select_at((300.0, 125.0)).0, None);
         set_flags(&mut s, id, |d| {
             d.hidden = false;
             d.style.visibility.minutes.on = false;
@@ -2141,10 +2162,17 @@ mod tests {
     fn select_at_selects_topmost_or_clears() {
         let mut s = state(500, false);
         let (id, _, _) = trend(&mut s);
-        assert_eq!(s.select_at((300.0, 125.0)), Some(id));
+        assert_eq!(
+            s.select_at((300.0, 125.0)),
+            (Some(id), vec![ChartEffect::SelectionChanged])
+        );
         assert_eq!(s.selected, Some(id));
         assert_eq!(s.selected_drawing().map(|d| d.id), Some(id));
-        assert_eq!(s.select_at((100.0, 350.0)), None);
+        assert_eq!(s.select_at((300.0, 125.0)), (Some(id), vec![]));
+        assert_eq!(
+            s.select_at((100.0, 350.0)),
+            (None, vec![ChartEffect::SelectionChanged])
+        );
         assert_eq!(s.selected, None);
         assert!(s.selected_drawing().is_none());
     }
@@ -2257,7 +2285,7 @@ mod tests {
         assert!(fx.contains(&ChartEffect::SelectionChanged));
         assert_eq!(s.selected, None);
         assert_eq!(s.hidden_count(), 1);
-        s.select_at(scr(&s, ca));
+        let _ = s.select_at(scr(&s, ca));
         s.hide_selected();
         assert_eq!(s.hidden_count(), 2);
         assert_eq!(s.unhide_all(), vec![ChartEffect::DrawingsChanged]);
@@ -2329,5 +2357,125 @@ mod tests {
             s.tool_styles[&Tool::TrendLine].visibility,
             xv_drawings::Visibility::default()
         );
+    }
+
+    #[test]
+    fn paste_of_unshown_drawing_keeps_selection() {
+        let mut s = state(500, false);
+        let (id, _, _) = trend(&mut s);
+        click(&mut s, (300.0, 125.0), no());
+        let mut hidden = s.drawings.get(id).unwrap().clone();
+        hidden.style.visibility.minutes.on = false;
+        let fx = s.paste(&hidden);
+        assert_eq!(fx, vec![ChartEffect::DrawingsChanged]);
+        assert_eq!(s.selected, Some(id));
+        assert_eq!(s.drawings.all().len(), 2);
+        // Nothing selected before: still nothing, no SelectionChanged.
+        s.key(ChartKey::Escape);
+        hidden.hidden = true;
+        assert_eq!(s.paste(&hidden), vec![ChartEffect::DrawingsChanged]);
+        assert_eq!(s.selected, None);
+    }
+
+    #[test]
+    fn cancel_edit_restores_only_the_edited_tool_entry() {
+        let mut s = state(500, false);
+        let (id, _, _) = trend(&mut s);
+        click(&mut s, (300.0, 125.0), no());
+        let orig = s.begin_edit().unwrap();
+        let mut d = orig.clone();
+        d.style.color = 0x00FF00FF;
+        s.preview_edit(d.clone());
+        // Another tool's last-used style changes meanwhile; it is kept.
+        let ray = Style {
+            width: 4,
+            ..Style::default()
+        };
+        s.tool_styles.insert(Tool::Ray, ray.clone());
+        // Extend Both makes it an extended line: that entry is restored too.
+        d.style.extend = xv_drawings::Extend::Both;
+        s.preview_edit(d);
+        assert!(s.tool_styles.contains_key(&Tool::ExtendedLine));
+        let fx = s.cancel_edit(orig.clone());
+        assert!(fx.contains(&ChartEffect::ToolStylesChanged));
+        assert_eq!(s.drawings.get(id).unwrap(), &orig);
+        assert_eq!(s.tool_styles.len(), 1);
+        assert_eq!(s.tool_styles[&Tool::Ray], ray);
+    }
+
+    #[test]
+    fn edit_ends_after_mid_edit_delete() {
+        for commit in [true, false] {
+            let mut s = state(500, false);
+            let (id, _, _) = trend(&mut s);
+            click(&mut s, (300.0, 125.0), no());
+            let orig = s.begin_edit().unwrap();
+            let mut d = orig.clone();
+            d.style.width = 4;
+            s.preview_edit(d);
+            s.key(ChartKey::Delete);
+            assert!(s.drawings.get(id).is_none());
+            let fx = if commit {
+                s.commit_edit(orig.clone())
+            } else {
+                s.cancel_edit(orig.clone())
+            };
+            assert!(!fx.contains(&ChartEffect::DrawingsChanged));
+            assert!(s.drawings.get(id).is_none());
+            // Only the delete is undoable.
+            assert!(s.key(ChartKey::Undo).contains(&ChartEffect::DrawingsChanged));
+            assert!(s.drawings.get(id).is_some());
+            assert!(!s.key(ChartKey::Undo).contains(&ChartEffect::DrawingsChanged));
+        }
+    }
+
+    #[test]
+    fn shift_with_off_screen_fixed_anchor() {
+        let mut s = state(500, false);
+        let a = at(&s, (-3000.0, 150.0));
+        let b = at(&s, (400.0, 100.0));
+        s.set_drawings(vec![Drawing::new(
+            DrawingId(1),
+            DrawingKind::TrendLine { a, b },
+            Style::default(),
+        )]);
+        let h = scr(&s, b);
+        s.mouse_down(h, sh(), 1);
+        s.mouse_move((h.0 + 20.0, h.1 + 37.0), sh(), true);
+        s.mouse_up((h.0 + 20.0, h.1 + 37.0), sh());
+        let (a2, b2) = ends(&s, DrawingId(1));
+        assert_eq!(a2, a);
+        assert_ne!(b2, b);
+        assert!(b2.price.is_finite());
+        assert!(on_45(angle(scr(&s, a2), scr(&s, b2))));
+    }
+
+    #[test]
+    fn rectangle_shift_corners_1_and_3_are_square() {
+        for idx in [1usize, 3] {
+            let mut s = state(500, false);
+            let (a, b) = (at(&s, (200.0, 150.0)), at(&s, (300.0, 230.0)));
+            s.set_drawings(vec![Drawing::new(
+                DrawingId(1),
+                DrawingKind::Rectangle { a, b },
+                Style::default(),
+            )]);
+            let corners = |s: &ChartState| handles(s.drawings.get(DrawingId(1)).unwrap(), &proj(s));
+            let c0 = corners(&s);
+            let (h, fixed) = (c0[idx], c0[(idx + 2) % 4]);
+            let to = (h.0 + 37.0, h.1 - 11.0);
+            s.mouse_down(h, sh(), 1);
+            s.mouse_move(to, sh(), true);
+            s.mouse_up(to, sh());
+            let c = corners(&s);
+            assert!(near(c[(idx + 2) % 4], fixed), "{c:?} {fixed:?}");
+            let (dx, dy) = (c[idx].0 - fixed.0, c[idx].1 - fixed.1);
+            assert!((dx.abs() - dy.abs()).abs() < 0.05, "{idx}: {dx} {dy}");
+            assert!(dx.abs() > 50.0);
+        }
+    }
+
+    fn near(a: (f32, f32), b: (f32, f32)) -> bool {
+        (a.0 - b.0).abs() < 0.05 && (a.1 - b.1).abs() < 0.05
     }
 }

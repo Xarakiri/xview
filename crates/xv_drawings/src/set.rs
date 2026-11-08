@@ -14,7 +14,7 @@ pub struct DrawingSet {
 
 impl DrawingSet {
     pub fn new(items: Vec<Drawing>) -> Self {
-        let next_id = items.iter().map(|d| d.id.0).max().map_or(1, |m| m + 1);
+        let next_id = items.iter().map(|d| d.id.0).max().map_or(1, |m| m.saturating_add(1));
         DrawingSet {
             items,
             next_id,
@@ -53,7 +53,7 @@ impl DrawingSet {
         }
         self.checkpoint();
         let id = DrawingId(self.next_id);
-        self.next_id += 1;
+        self.next_id = self.next_id.saturating_add(1);
         self.items.push(Drawing::new(id, kind, style));
         Some(id)
     }
@@ -121,7 +121,7 @@ impl DrawingSet {
         }
         self.checkpoint();
         let id = DrawingId(self.next_id);
-        self.next_id += 1;
+        self.next_id = self.next_id.saturating_add(1);
         let mut c = d.clone();
         c.id = id;
         self.items.push(c);
@@ -205,6 +205,14 @@ mod tests {
 
     fn k(p: f64) -> DrawingKind {
         DrawingKind::HorizontalLine { price: p }
+    }
+
+    #[test]
+    fn ids_saturate_instead_of_overflowing() {
+        let top = Drawing::new(DrawingId(u64::MAX), k(1.0), Style::default());
+        let mut s = DrawingSet::new(vec![top.clone()]);
+        assert!(s.add(k(2.0), Style::default()).is_some());
+        assert!(s.insert_copy(&top).is_some());
     }
 
     #[test]
