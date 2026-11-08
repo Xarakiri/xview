@@ -124,6 +124,8 @@ impl DrawingSet {
         self.next_id = self.next_id.saturating_add(1);
         let mut c = d.clone();
         c.id = id;
+        // A clone or paste is placed to be moved: never locked.
+        c.locked = false;
         self.items.push(c);
         Some(id)
     }
@@ -374,7 +376,10 @@ mod tests {
         assert_eq!(
             s.insert_copy(&Drawing::new(DrawingId(1), k(f64::NAN), Style::default())),
             None
-        );
+        );        let mut locked = src.clone();
+        locked.locked = true;
+        let id = s.insert_copy(&locked).unwrap();
+        assert!(!s.get(id).unwrap().locked);
     }
 
     #[test]

@@ -945,6 +945,11 @@ impl Workspace {
     }
 
     fn schedule_drawings_save(&mut self, cx: &mut Context<Self>) {
+        // An open settings dialog's preview is not committed; closing the
+        // dialog queues the final state.
+        if self.settings.is_some() {
+            return;
+        }
         let Some(key) = self.drawings_key.clone() else {
             return;
         };
@@ -986,6 +991,9 @@ impl Workspace {
     }
 
     fn schedule_templates_save(&mut self, cx: &mut Context<Self>) {
+        if self.settings.is_some() {
+            return;
+        }
         store_tool_styles(&mut self.templates, &self.chart.read(cx).state.tool_styles);
         self.persistence
             .schedule_templates_save(self.templates.clone(), cx);
@@ -1079,6 +1087,10 @@ impl Workspace {
     fn drop_drawing_settings(&mut self, cx: &mut Context<Self>) {
         if self.settings.take().is_some() {
             self.chart.update(cx, |c, _| c.modal_open = false);
+            // Saves were held while the dialog was open: queue the
+            // committed (Ok) or restored (Cancel) state now.
+            self.schedule_drawings_save(cx);
+            self.schedule_templates_save(cx);
             cx.notify();
         }
     }
@@ -1158,12 +1170,8 @@ impl Workspace {
     fn flush_all(&mut self, cx: &mut Context<Self>) {
         self.bounds_save = None;
         // An open settings dialog's preview is not a committed edit: put
-        // the original back and queue that (the change events would only
-        // arrive after the flush).
-        if self.close_drawing_settings(cx) {
-            self.schedule_drawings_save(cx);
-            self.schedule_templates_save(cx);
-        }
+        // the original back (closing queues the restored state).
+        self.close_drawing_settings(cx);
         self.flush_drawings(cx);
         if let Err(e) = self.persistence.flush_templates() {
             self.report_templates_error(e, cx);

@@ -36,7 +36,18 @@ pub fn from_json(s: &str) -> Result<DrawingsFile, DrawingsError> {
             version.min(u32::MAX as u64) as u32,
         ));
     }
-    serde_json::from_value(v).map_err(|e| DrawingsError::Parse(e.to_string()))
+    let mut f: DrawingsFile =
+        serde_json::from_value(v).map_err(|e| DrawingsError::Parse(e.to_string()))?;
+    if version == 1 {
+        // M1 always drew a horizontal line's price label; v2 makes it a
+        // style option, on by default for new horizontal lines.
+        for d in &mut f.drawings {
+            if matches!(d.kind, DrawingKind::HorizontalLine { .. }) {
+                d.style.price_labels = true;
+            }
+        }
+    }
+    Ok(f)
 }
 
 #[cfg(test)]
@@ -87,11 +98,15 @@ mod tests {
             let want = Style {
                 color: PALETTE[i],
                 width: (i as u8 % 4) + 1,
+                price_labels: matches!(d.kind, DrawingKind::HorizontalLine { .. }),
                 ..Style::default()
             };
             assert_eq!(d.style, want);
             assert_eq!((&d.name, d.locked, d.hidden), (&None, false, false));
         }
+        assert!(f.drawings.iter().any(|d| {
+            matches!(d.kind, DrawingKind::HorizontalLine { .. }) && d.style.price_labels
+        }));
         assert!(matches!(f.drawings[4].kind, DrawingKind::Rectangle { .. }));
         assert_eq!(f.drawings[4].style.fill, None);
         let out = to_json(&DrawingsFile {

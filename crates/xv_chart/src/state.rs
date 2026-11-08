@@ -544,10 +544,6 @@ impl ChartState {
         self.pending.is_some()
     }
 
-    pub fn set_selected_style(&mut self, s: Style) -> Vec<ChartEffect> {
-        self.update_selected(|d| d.style = s)
-    }
-
     pub fn selected_drawing(&self) -> Option<&Drawing> {
         self.drawings.get(self.selected?)
     }
@@ -1596,14 +1592,14 @@ mod tests {
     fn style_and_clear() {
         let mut s = state(500, false);
         let (id, _, _) = trend(&mut s);
-        assert!(s.set_selected_style(Style::default()).is_empty());
+        assert!(s.update_selected(|d| d.style = Style::default()).is_empty());
         click(&mut s, (300.0, 125.0), no());
         let st = Style {
             color: 0xFF0000FF,
             width: 3,
             ..Style::default()
         };
-        let fx = s.set_selected_style(st.clone());
+        let fx = s.update_selected(|d| d.style = st.clone());
         assert_eq!(
             fx,
             vec![ChartEffect::DrawingsChanged, ChartEffect::ToolStylesChanged]
