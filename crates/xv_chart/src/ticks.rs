@@ -61,7 +61,7 @@ pub fn price_ticks(r: PriceRange, height: f32, tick_size: f64) -> Vec<f64> {
 }
 
 /// Number of decimals needed to represent multiples of `tick_size`.
-fn decimals_of(tick_size: f64) -> usize {
+pub fn decimals_of(tick_size: f64) -> usize {
     if !tick_size.is_finite() || tick_size <= 0.0 {
         return 2;
     }

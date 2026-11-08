@@ -15,6 +15,9 @@ pub struct ChartColors {
     pub last_price_up: u32,
     pub last_price_down: u32,
     pub selection: u32,
+    /// Background box and text of drawing stats.
+    pub stats_bg: u32,
+    pub stats_text: u32,
 }
 
 impl ChartColors {
@@ -34,6 +37,8 @@ impl ChartColors {
             last_price_up: 0x1E9E74FF,
             last_price_down: 0xD9455AFF,
             selection: 0x3B6FE8FF,
+            stats_bg: 0xF1F3F6F2,
+            stats_text: 0x1F2933FF,
         }
     }
 
@@ -53,6 +58,8 @@ impl ChartColors {
             last_price_up: 0x34C28FFF,
             last_price_down: 0xF0566AFF,
             selection: 0x6FA3FFFF,
+            stats_bg: 0x2A313BF2,
+            stats_text: 0xD5DAE1FF,
         }
     }
 }
@@ -81,7 +88,7 @@ mod tests {
             let all = [
                 c.background, c.grid, c.text, c.muted_text, c.up, c.down, c.up_volume,
                 c.down_volume, c.crosshair, c.axis_label_bg, c.axis_label_text, c.last_price_up,
-                c.last_price_down, c.selection,
+                c.last_price_down, c.selection, c.stats_bg, c.stats_text,
             ];
             for v in all.iter().chain(xv_drawings::PALETTE.iter()) {
                 assert!(!BANNED_RGB.contains(&(v >> 8)), "{v:08X}");

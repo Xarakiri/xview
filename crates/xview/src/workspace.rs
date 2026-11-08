@@ -4,7 +4,8 @@
 //!
 //! Rendering cost: the toolbars and panels are separate entities embedded as
 //! cached views, so a chart notify (every mouse move) re-renders only the
-//! chart, the style bar and this light layout shell. Each cached view
+//! chart and this light layout shell; the drawing toolbar over the chart is
+//! cached too and re-renders only when its snapshot changes. Each cached view
 //! notifies itself only when what it shows changes.
 
 use std::path::{Path, PathBuf};
@@ -17,23 +18,26 @@ use gpui::{
     div, prelude::*, px,
 };
 use gpui_tokio::Tokio;
-use xv_chart::ChartEffect;
+use xv_chart::{ChartEffect, MagnetMode};
 use xv_core::{Series, SourceId, Symbol, SymbolKey, Timeframe, TzOffset};
 use xv_data::{DataError, HistoryPage, LoadGuard, LoadToken, SourceRegistry};
-use xv_drawings::Tool;
+use xv_drawings::{Drawing, DrawingId, Tool};
 use xv_source_binance::BINANCE_SOURCE_ID;
 use xv_source_csv::{CSV_SOURCE_ID, CsvError, CsvLoadReport, CsvSource};
-use xv_store::{LoadedDrawings, Settings, ThemeMode, WindowRect};
+use xv_store::{
+    LoadedDrawings, LoadedTemplates, MagnetSetting, Settings, TemplatesFile, ThemeMode, WindowRect,
+};
 
 use crate::bottom_bar::BottomBar;
-use crate::chart_view::{ChartView, ChartViewEvent};
+use crate::chart_view::{ChartView, ChartViewEvent, CopyDrawing, PasteDrawing};
 use crate::demo;
+use crate::drawing_settings::{DrawingSettings, SettingsEvent};
+use crate::drawing_toolbar::{DrawingToolbar, ToolbarEvent};
 use crate::left_toolbar::LeftToolbar;
 use crate::loader::{BackfillOutcome, Loader};
 use crate::persistence::Persistence;
 use crate::symbol_search::{SearchEvent, SymbolSearch};
 use crate::side_panel::SidePanel;
-use crate::style_bar::StyleBar;
 use crate::theme::AppTheme;
 use crate::top_bar::TopBar;
 
@@ -66,6 +70,8 @@ actions!(
         ToggleHideDrawings,
         ToggleLockDrawings,
         ToggleMagnet,
+        ToggleStayInDrawingMode,
+        UnhideAllDrawings,
         ClearDrawings,
         OpenSymbolSearch,
         OpenCsv,
@@ -82,6 +88,63 @@ pub struct SelectTimeframe(pub Timeframe);
 #[derive(Clone, Debug, PartialEq, Action)]
 #[action(namespace = workspace, no_json)]
 pub struct SelectTool(pub Tool);
+
+/// Picks the magnet mode and turns the magnet on.
+#[derive(Clone, Debug, PartialEq, Action)]
+#[action(namespace = workspace, no_json)]
+pub struct SetMagnetMode(pub MagnetMode);
+
+/// Every drawing tool whose last-used style is kept in `templates.json`.
+pub const STYLED_TOOLS: [Tool; 6] = [
+    Tool::TrendLine,
+    Tool::ExtendedLine,
+    Tool::Ray,
+    Tool::HorizontalLine,
+    Tool::VerticalLine,
+    Tool::Rectangle,
+];
+
+/// The tool with `Tool::key() == key`, if it is a drawing tool.
+pub fn tool_from_key(key: &str) -> Option<Tool> {
+    STYLED_TOOLS.iter().copied().find(|t| t.key() == key)
+}
+
+/// `tool_styles` from a templates file's `last_used`, skipping unknown keys.
+pub fn tool_styles_from(
+    f: &TemplatesFile,
+) -> std::collections::HashMap<Tool, xv_drawings::Style> {
+    f.last_used
+        .iter()
+        .filter_map(|(k, st)| tool_from_key(k).map(|t| (t, st.clone())))
+        .collect()
+}
+
+/// Writes `styles` into `f.last_used`, keeping keys of unknown tools.
+pub fn store_tool_styles(
+    f: &mut TemplatesFile,
+    styles: &std::collections::HashMap<Tool, xv_drawings::Style>,
+) {
+    for t in STYLED_TOOLS {
+        match styles.get(&t) {
+            Some(st) => f.last_used.insert(t.key().to_string(), st.clone()),
+            None => f.last_used.remove(t.key()),
+        };
+    }
+}
+
+pub fn magnet_mode_of(s: MagnetSetting) -> MagnetMode {
+    match s {
+        MagnetSetting::Weak => MagnetMode::Weak,
+        MagnetSetting::Strong => MagnetMode::Strong,
+    }
+}
+
+pub fn magnet_setting_of(m: MagnetMode) -> MagnetSetting {
+    match m {
+        MagnetMode::Weak => MagnetSetting::Weak,
+        MagnetMode::Strong => MagnetSetting::Strong,
+    }
+}
 
 /// Fits the last `span_ms` (or everything for `None`) into the chart.
 #[derive(Clone, Debug, PartialEq, Action)]
@@ -147,11 +210,17 @@ pub struct Workspace {
     window_rect: Option<WindowRect>,
     /// Last settings save error shown, so bounds changes don't repeat it.
     settings_error: Option<String>,
+    /// Drawing templates (last-used styles), saved to `templates.json`.
+    templates: TemplatesFile,
+    /// In-app clipboard (cmd-c / cmd-v), for the current symbol only.
+    clipboard: Option<Drawing>,
+    /// The open drawing settings dialog.
+    settings: Option<(Entity<DrawingSettings>, Vec<Subscription>)>,
     bounds_save: Option<Task<()>>,
     resolve: Option<Task<()>>,
     top_bar: Entity<TopBar>,
     left_toolbar: Entity<LeftToolbar>,
-    style_bar: Entity<StyleBar>,
+    drawing_toolbar: Entity<DrawingToolbar>,
     side_panel: Entity<SidePanel>,
     bottom_bar: Entity<BottomBar>,
     _subscriptions: Vec<Subscription>,
@@ -316,6 +385,21 @@ pub fn load_error_text(symbol: &Symbol, tf: Timeframe, e: &DataError) -> String 
     }
 }
 
+pub fn corrupt_templates_text(path: &Path, moved: bool) -> String {
+    if moved {
+        format!(
+            "Drawing templates were unreadable; the file was kept at {}",
+            path.display()
+        )
+    } else {
+        format!(
+            "Drawing templates are unreadable and the file could not be moved aside ({}). \
+             Last-used styles won't be saved until that file is fixed or removed.",
+            path.display()
+        )
+    }
+}
+
 pub fn corrupt_drawings_text(symbol: &Symbol, path: &Path, moved: bool) -> String {
     if moved {
         format!(
@@ -396,8 +480,23 @@ impl Workspace {
             if let Some(spacing) = demo::bar_spacing() {
                 view.state.vp.bar_spacing = spacing;
             }
+            view.state.magnet = settings.magnet_on;
+            view.state.magnet_mode = magnet_mode_of(settings.magnet_mode);
+            view.state.stay_in_drawing_mode = settings.stay_in_drawing_mode;
             view
         });
+        let persistence = Persistence::new(dir);
+        let mut startup_banners = Vec::new();
+        let templates = match persistence.load_templates() {
+            LoadedTemplates::Ok(f) => f,
+            LoadedTemplates::Missing => TemplatesFile::default(),
+            LoadedTemplates::Corrupt { path, moved } => {
+                startup_banners.push(corrupt_templates_text(&path, moved));
+                TemplatesFile::default()
+            }
+        };
+        let styles = tool_styles_from(&templates);
+        chart.update(cx, |c, _| c.state.tool_styles = styles);
         let events = cx.subscribe_in(&chart, window, |this, _, e: &ChartViewEvent, window, cx| {
             match e {
                 ChartViewEvent::NeedOlder(before) => this.loader.load_older(*before, cx),
@@ -405,7 +504,17 @@ impl Workspace {
                 ChartViewEvent::TypeToSearch(letter) => {
                     this.open_search(letter.clone(), window, cx)
                 }
-                ChartViewEvent::ToolFinished | ChartViewEvent::SelectionChanged => {}
+                ChartViewEvent::ToolStylesChanged => this.schedule_templates_save(cx),
+                ChartViewEvent::ContextMenu { position, .. } => {
+                    let position = *position;
+                    this.drawing_toolbar.update(cx, |tb, cx| {
+                        tb.open_context_menu(position, window, cx)
+                    });
+                }
+                ChartViewEvent::OpenSettings(id) => this.open_drawing_settings(*id, window, cx),
+                ChartViewEvent::ToolFinished
+                | ChartViewEvent::SelectionChanged
+                | ChartViewEvent::DismissPopover => {}
             }
         });
         if demo::autopan() {
@@ -432,13 +541,19 @@ impl Workspace {
 
         let top_bar = cx.new(|_| TopBar::new(theme.clone(), &start.symbol, start.timeframe));
         let left_toolbar = cx.new(|cx| LeftToolbar::new(chart.clone(), theme.clone(), cx));
-        let style_bar = cx.new(|_| StyleBar::new(chart.clone(), theme.clone()));
+        let drawing_toolbar = cx.new(|cx| {
+            DrawingToolbar::new(chart.clone(), theme.clone(), &templates, window, cx)
+        });
+        let toolbar_events =
+            cx.subscribe(&drawing_toolbar, |this, _, e: &ToolbarEvent, cx| {
+                this.on_toolbar_event(e, cx)
+            });
         let side_panel = cx.new(|cx| SidePanel::new(chart.clone(), theme.clone(), cx));
         let bottom_bar = cx.new(|cx| BottomBar::new(chart.clone(), theme.clone(), use_utc, cx));
 
         let mut this = Workspace {
             loader: Loader::new(registry, csv, chart.clone()),
-            persistence: Persistence::new(dir),
+            persistence,
             chart,
             theme,
             symbol: start.symbol.clone(),
@@ -452,17 +567,20 @@ impl Workspace {
             drawings_key: None,
             window_rect: Some(window_rect(window)),
             settings_error: None,
+            templates,
+            clipboard: None,
+            settings: None,
             bounds_save: None,
             resolve: None,
             top_bar,
             left_toolbar,
-            style_bar,
+            drawing_toolbar,
             side_panel,
             bottom_bar,
-            _subscriptions: vec![events, quit, bounds],
+            _subscriptions: vec![events, quit, bounds, toolbar_events],
         };
         // Before opening, so a corrupt-drawings banner lands on top.
-        if let Some(text) = start.banner {
+        for text in startup_banners.into_iter().chain(start.banner) {
             this.show_banner(text, BannerKind::Info, cx);
         }
         this.open_symbol(start.symbol.clone(), start.timeframe, cx);
@@ -796,6 +914,15 @@ impl Workspace {
         if self.drawings_key.as_ref() == Some(&key) {
             return;
         }
+        // An open settings dialog cancels, and an open color picker commits
+        // its session, into the old symbol's set while that set is still
+        // loaded; the result is queued under the old key before the flush
+        // (the DrawingsChanged events would only arrive after the key has
+        // moved on).
+        let closed = self.close_drawing_settings(cx);
+        if self.drawing_toolbar.update(cx, |tb, cx| tb.close_popover(cx)) || closed {
+            self.schedule_drawings_save(cx);
+        }
         self.flush_drawings(cx);
         let ds = match self.persistence.load_drawings(&key) {
             LoadedDrawings::Ok(ds) => ds,
@@ -811,9 +938,18 @@ impl Workspace {
             cx.notify();
         });
         self.drawings_key = Some(key);
+        // Copy and paste work within one symbol.
+        self.clipboard = None;
+        self.drawing_toolbar
+            .update(cx, |tb, cx| tb.set_has_clipboard(false, cx));
     }
 
     fn schedule_drawings_save(&mut self, cx: &mut Context<Self>) {
+        // An open settings dialog's preview is not committed; closing the
+        // dialog queues the final state.
+        if self.settings.is_some() {
+            return;
+        }
         let Some(key) = self.drawings_key.clone() else {
             return;
         };
@@ -854,7 +990,149 @@ impl Workspace {
         }
     }
 
-    fn current_settings(&self) -> Settings {
+    fn schedule_templates_save(&mut self, cx: &mut Context<Self>) {
+        if self.settings.is_some() {
+            return;
+        }
+        store_tool_styles(&mut self.templates, &self.chart.read(cx).state.tool_styles);
+        self.persistence
+            .schedule_templates_save(self.templates.clone(), cx);
+    }
+
+    /// Shows a failed templates save in the banner.
+    pub(crate) fn report_templates_error(&mut self, e: std::io::Error, cx: &mut Context<Self>) {
+        let text = if e.kind() == std::io::ErrorKind::InvalidData {
+            format!(
+                "Couldn't save drawing templates: {} is unreadable and was kept; fix or remove it to save again",
+                xv_store::templates_path(self.persistence.dir()).display()
+            )
+        } else {
+            format!("Couldn't save drawing templates: {e}")
+        };
+        self.show_banner(text, BannerKind::Info, cx);
+    }
+
+    fn copy_drawing(&mut self, cx: &mut Context<Self>) {
+        if let Some(d) = self.chart.read(cx).state.selected_drawing().cloned() {
+            self.clipboard = Some(d);
+            self.drawing_toolbar
+                .update(cx, |tb, cx| tb.set_has_clipboard(true, cx));
+        }
+    }
+
+    fn on_toolbar_event(&mut self, e: &ToolbarEvent, cx: &mut Context<Self>) {
+        match e {
+            ToolbarEvent::Copy => return self.copy_drawing(cx),
+            ToolbarEvent::Paste => return self.paste_drawing(cx),
+            ToolbarEvent::SaveTemplate { tool, name, style } => {
+                let list = self.templates.named.entry(tool.key().to_string()).or_default();
+                let t = xv_store::NamedTemplate {
+                    name: name.clone(),
+                    style: style.clone(),
+                };
+                match list.iter_mut().find(|t| t.name == *name) {
+                    Some(old) => *old = t,
+                    None => list.push(t),
+                }
+            }
+            ToolbarEvent::DeleteTemplate { tool, name } => {
+                if let Some(list) = self.templates.named.get_mut(tool.key()) {
+                    list.retain(|t| t.name != *name);
+                    if list.is_empty() {
+                        self.templates.named.remove(tool.key());
+                    }
+                }
+            }
+            ToolbarEvent::CustomColor(c) => xv_store::push_custom_color(&mut self.templates, *c),
+        }
+        let f = self.templates.clone();
+        self.drawing_toolbar
+            .update(cx, |tb, cx| tb.set_templates(&f, cx));
+        if let Some((d, _)) = &self.settings {
+            d.update(cx, |d, cx| d.set_templates(&f, cx));
+        }
+        self.schedule_templates_save(cx);
+    }
+
+    // ---- drawing settings dialog ----
+
+    /// Opens the settings dialog for drawing `id` (it must be the selected
+    /// one). Every open path ends here: double-click, the toolbar's Settings
+    /// button, More → Settings… and the context menu's Settings….
+    fn open_drawing_settings(&mut self, id: DrawingId, window: &mut Window, cx: &mut Context<Self>) {
+        if self.settings.is_some() {
+            return;
+        }
+        self.drawing_toolbar.update(cx, |tb, cx| tb.close_popover(cx));
+        let original = self.chart.update(cx, |c, _| {
+            (c.state.selected == Some(id))
+                .then(|| c.state.begin_edit())
+                .flatten()
+        });
+        let Some(original) = original else { return };
+        let (chart, theme) = (self.chart.clone(), self.theme.clone());
+        let templates = self.templates.clone();
+        let dialog = cx.new(|cx| DrawingSettings::new(chart, original, theme, &templates, window, cx));
+        let closed = cx.subscribe_in(&dialog, window, |this, _, _: &SettingsEvent, window, cx| {
+            this.drop_drawing_settings(cx);
+            window.focus(&this.chart.focus_handle(cx), cx);
+        });
+        let templates = cx.subscribe(&dialog, |this, _, e: &ToolbarEvent, cx| this.on_toolbar_event(e, cx));
+        window.focus(&dialog.focus_handle(cx), cx);
+        self.chart.update(cx, |c, _| c.modal_open = true);
+        self.settings = Some((dialog, vec![closed, templates]));
+        cx.notify();
+    }
+
+    fn drop_drawing_settings(&mut self, cx: &mut Context<Self>) {
+        if self.settings.take().is_some() {
+            self.chart.update(cx, |c, _| c.modal_open = false);
+            // Saves were held while the dialog was open: queue the
+            // committed (Ok) or restored (Cancel) state now.
+            self.schedule_drawings_save(cx);
+            self.schedule_templates_save(cx);
+            cx.notify();
+        }
+    }
+
+    /// Cancels and closes an open settings dialog. Returns whether one was
+    /// open. Focus goes back to the chart on the next render.
+    fn close_drawing_settings(&mut self, cx: &mut Context<Self>) -> bool {
+        let Some((d, _)) = &self.settings else {
+            return false;
+        };
+        d.update(cx, |d, cx| d.finish(false, cx));
+        self.drop_drawing_settings(cx);
+        true
+    }
+
+    fn paste_drawing(&mut self, cx: &mut Context<Self>) {
+        if let Some(d) = self.clipboard.clone() {
+            self.with_chart(cx, |s| s.paste(&d));
+        }
+    }
+
+    fn set_magnet(&mut self, on: bool, mode: Option<MagnetMode>, cx: &mut Context<Self>) {
+        self.with_chart(cx, |s| {
+            s.magnet = on;
+            if let Some(m) = mode {
+                s.magnet_mode = m;
+            }
+            Vec::new()
+        });
+        self.save_settings(cx);
+    }
+
+    fn set_stay_in_drawing_mode(&mut self, on: bool, cx: &mut Context<Self>) {
+        self.with_chart(cx, |s| {
+            s.stay_in_drawing_mode = on;
+            Vec::new()
+        });
+        self.save_settings(cx);
+    }
+
+    fn current_settings(&self, cx: &App) -> Settings {
+        let s = &self.chart.read(cx).state;
         Settings {
             version: 1,
             last_symbol: Some(self.symbol.key()),
@@ -862,11 +1140,14 @@ impl Workspace {
             window: self.window_rect,
             theme: self.theme.mode,
             use_utc: self.use_utc,
+            magnet_on: s.magnet,
+            magnet_mode: magnet_setting_of(s.magnet_mode),
+            stay_in_drawing_mode: s.stay_in_drawing_mode,
         }
     }
 
     fn save_settings(&mut self, cx: &mut Context<Self>) {
-        match self.persistence.save_settings(&self.current_settings()) {
+        match self.persistence.save_settings(&self.current_settings(cx)) {
             Ok(()) => self.settings_error = None,
             Err(e) => {
                 let text = if e.kind() == std::io::ErrorKind::InvalidData {
@@ -888,7 +1169,13 @@ impl Workspace {
     /// Writes everything pending: on quit and window close.
     fn flush_all(&mut self, cx: &mut Context<Self>) {
         self.bounds_save = None;
+        // An open settings dialog's preview is not a committed edit: put
+        // the original back (closing queues the restored state).
+        self.close_drawing_settings(cx);
         self.flush_drawings(cx);
+        if let Err(e) = self.persistence.flush_templates() {
+            self.report_templates_error(e, cx);
+        }
         self.save_settings(cx);
     }
 
@@ -917,7 +1204,7 @@ impl Workspace {
         self.top_bar.update(cx, |v, cx| v.set_theme(t.clone(), cx));
         self.left_toolbar
             .update(cx, |v, cx| v.set_theme(t.clone(), cx));
-        self.style_bar
+        self.drawing_toolbar
             .update(cx, |v, cx| v.set_theme(t.clone(), cx));
         self.side_panel
             .update(cx, |v, cx| v.set_theme(t.clone(), cx));
@@ -1045,6 +1332,55 @@ impl Workspace {
         }
     }
 
+    pub(crate) fn debug_set_magnet(&mut self, on: bool, mode: Option<MagnetMode>, cx: &mut Context<Self>) {
+        self.set_magnet(on, mode, cx);
+    }
+
+    pub(crate) fn debug_set_stay(&mut self, on: bool, cx: &mut Context<Self>) {
+        self.set_stay_in_drawing_mode(on, cx);
+    }
+
+    pub(crate) fn debug_open_flyout(&mut self, name: &str, cx: &mut Context<Self>) {
+        let name = name.to_string();
+        self.left_toolbar
+            .update(cx, |tb, cx| tb.debug_open_flyout(&name, cx));
+    }
+
+    pub(crate) fn debug_open_popover(&mut self, name: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let name = name.to_string();
+        self.drawing_toolbar
+            .update(cx, |tb, cx| tb.debug_open_popover(&name, window, cx));
+    }
+
+    pub(crate) fn debug_pick_color(&mut self, color: u32, cx: &mut Context<Self>) {
+        self.drawing_toolbar
+            .update(cx, |tb, cx| tb.debug_pick_color(color, cx));
+    }
+
+    pub(crate) fn debug_save_template(&mut self, name: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let name = name.to_string();
+        self.drawing_toolbar
+            .update(cx, |tb, cx| tb.debug_save_template(&name, window, cx));
+    }
+
+    pub(crate) fn debug_open_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(id) = self.chart.read(cx).state.selected {
+            self.open_drawing_settings(id, window, cx);
+        }
+    }
+
+    pub(crate) fn debug_settings(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        f: impl FnOnce(&mut DrawingSettings, &mut Window, &mut Context<DrawingSettings>),
+    ) {
+        match &self.settings {
+            Some((d, _)) => d.update(cx, |d, cx| f(d, window, cx)),
+            None => eprintln!("xview-script: no settings dialog open"),
+        }
+    }
+
     pub(crate) fn debug_chart(
         &mut self,
         cx: &mut Context<Self>,
@@ -1088,7 +1424,15 @@ impl Render for Workspace {
                     .w_full()
                     .overflow_hidden()
                     .child(self.chart.clone())
-                    .child(self.style_bar.clone()),
+                    .child(
+                        self.drawing_toolbar.clone().cached(
+                            StyleRefinement::default()
+                                .absolute()
+                                .top_0()
+                                .left_0()
+                                .size_full(),
+                        ),
+                    ),
             )
             .child(
                 self.bottom_bar.clone().cached(
@@ -1117,10 +1461,30 @@ impl Render for Workspace {
                 this.with_chart(cx, |s| s.set_locked(!s.drawings_locked))
             }))
             .on_action(cx.listener(|this, _: &ToggleMagnet, _, cx| {
-                this.with_chart(cx, |s| {
-                    s.magnet = !s.magnet;
-                    Vec::new()
-                })
+                let on = !this.chart.read(cx).state.magnet;
+                this.set_magnet(on, None, cx);
+            }))
+            .on_action(cx.listener(|this, a: &SetMagnetMode, _, cx| {
+                this.set_magnet(true, Some(a.0), cx)
+            }))
+            .on_action(cx.listener(|this, _: &ToggleStayInDrawingMode, _, cx| {
+                let on = !this.chart.read(cx).state.stay_in_drawing_mode;
+                this.set_stay_in_drawing_mode(on, cx);
+            }))
+            .on_action(cx.listener(|this, _: &UnhideAllDrawings, _, cx| {
+                this.with_chart(cx, |s| s.unhide_all())
+            }))
+            // cmd-c / cmd-v do nothing while a toolbar popover or the
+            // settings dialog is open.
+            .on_action(cx.listener(|this, _: &CopyDrawing, _, cx| {
+                if !this.chart.read(cx).input_blocked() {
+                    this.copy_drawing(cx)
+                }
+            }))
+            .on_action(cx.listener(|this, _: &PasteDrawing, _, cx| {
+                if !this.chart.read(cx).input_blocked() {
+                    this.paste_drawing(cx)
+                }
             }))
             .on_action(
                 cx.listener(|this, _: &ClearDrawings, window, cx| this.clear_drawings(window, cx)),
@@ -1132,11 +1496,22 @@ impl Render for Workspace {
                     s.check_need_older()
                 })
             }))
+            // The settings dialog is modal: no search, CSV or theme switch.
             .on_action(cx.listener(|this, _: &OpenSymbolSearch, window, cx| {
-                this.open_search(String::new(), window, cx)
+                if this.settings.is_none() {
+                    this.open_search(String::new(), window, cx)
+                }
             }))
-            .on_action(cx.listener(|this, _: &OpenCsv, _, cx| this.open_csv(cx)))
-            .on_action(cx.listener(|this, _: &ToggleTheme, _, cx| this.toggle_theme(cx)))
+            .on_action(cx.listener(|this, _: &OpenCsv, _, cx| {
+                if this.settings.is_none() {
+                    this.open_csv(cx)
+                }
+            }))
+            .on_action(cx.listener(|this, _: &ToggleTheme, _, cx| {
+                if this.settings.is_none() {
+                    this.toggle_theme(cx)
+                }
+            }))
             .on_action(cx.listener(|this, _: &ToggleClockUtc, _, cx| this.toggle_clock_utc(cx)))
             .relative()
             .flex()
@@ -1178,6 +1553,7 @@ impl Render for Workspace {
                     ),
             )
             .children(self.search.as_ref().map(|(search, _)| search.clone()))
+            .children(self.settings.as_ref().map(|(d, _)| d.clone()))
     }
 }
 
@@ -1341,6 +1717,37 @@ mod tests {
             - xv_chart::TIME_AXIS_HEIGHT;
         assert!(plot_w >= 300., "{plot_w}");
         assert!(plot_h >= 300., "{plot_h}");
+    }
+
+    #[test]
+    fn last_used_styles_round_trip_and_keep_unknown_keys() {
+        let mut f = TemplatesFile::default();
+        let st = |w: u8| xv_drawings::Style {
+            width: w,
+            ..xv_drawings::Style::default()
+        };
+        f.last_used.insert("trend_line".into(), st(3));
+        f.last_used.insert("ray".into(), st(1));
+        f.last_used.insert("fib_retracement".into(), st(4));
+        let mut styles = tool_styles_from(&f);
+        assert_eq!(styles.len(), 2);
+        assert_eq!(styles[&Tool::TrendLine], st(3));
+        styles.remove(&Tool::Ray);
+        styles.insert(Tool::Rectangle, st(2));
+        store_tool_styles(&mut f, &styles);
+        let keys: Vec<&str> = f.last_used.keys().map(String::as_str).collect();
+        assert_eq!(keys, ["fib_retracement", "rectangle", "trend_line"]);
+        for t in STYLED_TOOLS {
+            assert_eq!(tool_from_key(t.key()), Some(t));
+        }
+        assert_eq!(tool_from_key("cursor"), None);
+    }
+
+    #[test]
+    fn magnet_setting_maps_both_ways() {
+        for m in [MagnetMode::Weak, MagnetMode::Strong] {
+            assert_eq!(magnet_mode_of(magnet_setting_of(m)), m);
+        }
     }
 
     #[test]

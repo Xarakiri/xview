@@ -1,8 +1,7 @@
 //! Symbol search modal: a minimal one-line text input over a result list.
 //!
-//! GPUI ships no text field, so the input is a focused element that edits
-//! its query from key-down events (typing, backspace, cmd-backspace,
-//! cmd-v). Every registered source is queried 150 ms after the last edit;
+//! The input uses the shared one-line key mapping from `text_input`
+//! (typing, backspace, cmd-backspace, cmd-v). Every registered source is queried 150 ms after the last edit;
 //! results keep the registry order (Binance first, then CSV files).
 //!
 //! While open, this is the only shell element that tracks focus. The
@@ -13,13 +12,14 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use gpui::{
-    Context, EventEmitter, FocusHandle, Focusable, FontWeight, KeyDownEvent, Keystroke,
+    Context, EventEmitter, FocusHandle, Focusable, FontWeight, KeyDownEvent,
     MouseButton, SharedString, Task, Window, div, prelude::*, px,
 };
 use gpui_tokio::Tokio;
 use xv_core::Symbol;
 use xv_data::{DataError, DataSource};
 
+use crate::text_input::{KeyAction, caret, key_action, sanitize_paste};
 use crate::theme::AppTheme;
 use crate::widgets::icon;
 
@@ -41,57 +41,6 @@ pub enum SearchEvent {
 pub struct SearchResult {
     pub symbol: Symbol,
     pub source: SharedString,
-}
-
-/// What a key press does to the modal.
-#[derive(Clone, Debug, PartialEq)]
-pub enum KeyAction {
-    Edit(String),
-    Move(isize),
-    Pick,
-    Dismiss,
-    Paste,
-    None,
-}
-
-/// Maps a keystroke to its effect on `query`.
-pub fn key_action(query: &str, k: &Keystroke) -> KeyAction {
-    let m = &k.modifiers;
-    match k.key.as_str() {
-        "escape" => return KeyAction::Dismiss,
-        "enter" => return KeyAction::Pick,
-        "up" => return KeyAction::Move(-1),
-        "down" => return KeyAction::Move(1),
-        "backspace" => {
-            if m.platform || m.alt {
-                return KeyAction::Edit(String::new());
-            }
-            let mut q = query.to_string();
-            q.pop();
-            return KeyAction::Edit(q);
-        }
-        "v" if m.platform => return KeyAction::Paste,
-        _ => {}
-    }
-    if m.platform || m.control || m.function {
-        return KeyAction::None;
-    }
-    match k.key_char.as_deref() {
-        Some(ch) if !ch.is_empty() && !ch.chars().any(char::is_control) => {
-            KeyAction::Edit(format!("{query}{ch}"))
-        }
-        _ => KeyAction::None,
-    }
-}
-
-/// Clipboard text reduced to one line of query text.
-pub fn sanitize_paste(text: &str) -> String {
-    text.lines()
-        .next()
-        .unwrap_or("")
-        .chars()
-        .filter(|c| !c.is_control())
-        .collect()
 }
 
 /// Moves the selection by `delta`, clamped to the list.
@@ -341,8 +290,7 @@ impl Render for SymbolSearch {
                     .flex_1()
                     .text_size(px(16.))
                     .when(!self.query.is_empty(), |d| d.child(query))
-                    // Caret.
-                    .child(div().w(px(1.5)).h(px(20.)).bg(t.text))
+                    .child(caret(20., &t))
                     .when(self.query.is_empty(), |d| {
                         d.child(div().pl(px(2.)).text_color(t.muted).child("Search"))
                     }),
@@ -409,7 +357,7 @@ impl Render for SymbolSearch {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gpui::Modifiers;
+    use gpui::{Keystroke, Modifiers};
     use xv_core::SourceId;
 
     fn ks(key: &str, ch: Option<&str>, m: Modifiers) -> Keystroke {

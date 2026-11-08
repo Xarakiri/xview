@@ -9,6 +9,7 @@ They are licensed with the rest of XView under GPL-3.0-or-later.
 
 | Icon | Origin |
 | --- | --- |
+| alarm_plus | Original (XView): clock with bells and a plus |
 | avatar_placeholder | Original (XView) |
 | bars_style | Original (XView brainstorm mockup, simplified) |
 | bell | Original (XView) |
@@ -24,22 +25,31 @@ They are licensed with the rest of XView under GPL-3.0-or-later.
 | extended_line | Original (XView) |
 | eye | Original (XView brainstorm mockup) |
 | fibonacci | Original (XView) |
+| grip | Original (XView): six-dot drag grip |
 | help | Original (XView) |
 | horizontal_line | Original (XView) |
 | horizontal_lines | Original (XView brainstorm mockup) |
 | horizontal_ray | Original (XView) |
 | list | Original (XView) |
 | lock | Original (XView brainstorm mockup) |
+| lock_open | Original (XView): `lock` with the shackle open |
 | magnet | Original (XView) |
+| magnet_strong | Original (XView): the magnet with two zigzag sparks |
+| magnet_weak | Original (XView): same artwork as `magnet` |
 | measure | Original (XView brainstorm mockup) |
 | more | Original (XView) |
 | patterns | Original (XView brainstorm mockup) |
+| pencil | Original (XView) |
+| pencil_lock | Original (XView): pencil with a small padlock |
 | plus | Original (XView) |
 | plus_circle | Original (XView brainstorm mockup) |
 | ray | Original (XView) |
 | rectangle | Original (XView) |
 | settings | Original (XView) |
+| settings_hex | Original (XView): hexagon around a circle |
+| templates | Original (XView): three squares and a plus |
 | text | Original (XView brainstorm mockup) |
+| text_color | Original (XView): serif T |
 | trash | Original (XView brainstorm mockup, with inner strokes) |
 | trend_line | Original (XView brainstorm mockup) |
 | vertical_line | Original (XView) |

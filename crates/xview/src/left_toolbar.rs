@@ -1,25 +1,33 @@
 //! Left drawing-tool column (spec §6.1). Re-renders only when the tool,
-//! magnet, lock or hide state changes, or a flyout opens or closes.
+//! magnet, stay-in-drawing-mode, lock or hide state (or the hidden-drawing
+//! count) changes, or a flyout opens or closes.
 
 use gpui::{
     Bounds, Context, Entity, Hsla, IntoElement, PathBuilder, Pixels, Render, SharedString,
     Subscription, Window, canvas, div, point, prelude::*, px,
 };
+use xv_chart::MagnetMode;
 use xv_drawings::Tool;
 
 use crate::chart_view::ChartView;
 use crate::theme::AppTheme;
 use crate::widgets::{
-    TOOLTIP_COMING_SOON, hsep, icon_button, menu_box, menu_row, popover_layer, tooltip,
+    DISABLED_OPACITY, TOOLTIP_COMING_SOON, hsep, icon_button, menu_box, menu_row,
+    popover_layer, tooltip,
 };
 use crate::workspace::{
-    ClearDrawings, LEFT_TOOLBAR_WIDTH, REGION_BORDER, SelectTool, ToggleHideDrawings,
-    ToggleLockDrawings, ToggleMagnet,
+    ClearDrawings, LEFT_TOOLBAR_WIDTH, REGION_BORDER, SelectTool, SetMagnetMode,
+    ToggleHideDrawings, ToggleLockDrawings, ToggleMagnet, ToggleStayInDrawingMode,
+    UnhideAllDrawings,
 };
 
 const BUTTON: f32 = 42.;
 const GAP: f32 = 6.;
 const CORNER: f32 = 6.;
+/// Click target around a toggle button's corner triangle (opens its flyout).
+const CORNER_HIT: f32 = 16.;
+const SWITCH_W: f32 = 34.;
+const SWITCH_H: f32 = 20.;
 
 /// One flyout entry: icon, label and the tool (None = coming soon).
 type Item = (&'static str, &'static str, Option<Tool>);
@@ -29,7 +37,7 @@ const GROUPS: [&[Item]; 3] = [
     &[
         ("trend_line", "Trend line", Some(Tool::TrendLine)),
         ("ray", "Ray", Some(Tool::Ray)),
-        ("extended_line", "Extended line", None),
+        ("extended_line", "Extended line", Some(Tool::ExtendedLine)),
     ],
     &[
         (
@@ -51,8 +59,12 @@ const GROUPS: [&[Item]; 3] = [
 struct Snapshot {
     tool: Tool,
     magnet: bool,
+    magnet_mode: MagnetMode,
+    stay: bool,
     locked: bool,
     hidden: bool,
+    /// Individually hidden drawings ("Show N hidden drawings").
+    hidden_count: usize,
 }
 
 impl Snapshot {
@@ -61,10 +73,21 @@ impl Snapshot {
         Snapshot {
             tool: s.tool,
             magnet: s.magnet,
+            magnet_mode: s.magnet_mode,
+            stay: s.stay_in_drawing_mode,
             locked: s.drawings_locked,
             hidden: s.drawings_hidden,
+            hidden_count: s.hidden_count(),
         }
     }
+}
+
+/// The open flyout.
+#[derive(Copy, Clone, PartialEq, Debug)]
+enum Flyout {
+    Group(usize),
+    Magnet,
+    Eye,
 }
 
 fn group_of(tool: Tool) -> Option<usize> {
@@ -78,7 +101,7 @@ pub struct LeftToolbar {
     snap: Snapshot,
     /// Index into the group's items of the last-used tool, per group.
     last_used: [usize; 3],
-    open_group: Option<usize>,
+    open: Option<Flyout>,
     _observe: Subscription,
 }
 
@@ -99,7 +122,7 @@ impl LeftToolbar {
             theme,
             snap,
             last_used: [0; 3],
-            open_group: None,
+            open: None,
             _observe: observe,
         }
     }
@@ -117,18 +140,35 @@ impl LeftToolbar {
         }
     }
 
-    fn set_open(&mut self, g: Option<usize>, cx: &mut Context<Self>) {
-        if self.open_group != g {
-            self.open_group = g;
+    fn set_open(&mut self, f: Option<Flyout>, cx: &mut Context<Self>) {
+        if self.open != f {
+            self.open = f;
             cx.notify();
         }
+    }
+
+    fn toggle_open(&mut self, f: Flyout, cx: &mut Context<Self>) {
+        let next = (self.open != Some(f)).then_some(f);
+        self.set_open(next, cx);
+    }
+
+    /// Forces a flyout open (debug script screenshots).
+    #[cfg(debug_assertions)]
+    pub fn debug_open_flyout(&mut self, name: &str, cx: &mut Context<Self>) {
+        let f = match name {
+            "magnet" => Some(Flyout::Magnet),
+            "eye" => Some(Flyout::Eye),
+            "trend" => Some(Flyout::Group(0)),
+            _ => None,
+        };
+        self.set_open(f, cx);
     }
 
     fn group_button(&self, g: usize, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
         let t = &self.theme;
         let (icon_name, _, _) = GROUPS[g][self.last_used[g]];
         let active = group_of(self.snap.tool) == Some(g);
-        let open = self.open_group == Some(g);
+        let open = self.open == Some(Flyout::Group(g));
         let mut button = icon_button(
             SharedString::from(format!("group-{g}")),
             icon_name,
@@ -139,14 +179,7 @@ impl LeftToolbar {
         )
         .relative()
         .when(!active, |b| b.child(corner(t.muted)))
-        .on_click(cx.listener(move |this, _, _, cx| {
-            let next = if this.open_group == Some(g) {
-                None
-            } else {
-                Some(g)
-            };
-            this.set_open(next, cx);
-        }));
+        .on_click(cx.listener(move |this, _, _, cx| this.toggle_open(Flyout::Group(g), cx)));
         if open {
             let menu = self.flyout(g, cx).into_any_element();
             let close = cx.listener(|this, _, _, cx| this.set_open(None, cx));
@@ -197,6 +230,137 @@ impl LeftToolbar {
             .tooltip(tooltip(tip, t))
             .on_click(move |_, window, cx| window.dispatch_action(action(), cx))
     }
+
+    /// A toggle button whose click dispatches `action` and whose corner
+    /// triangle opens `flyout`, built by `menu`.
+    #[allow(clippy::too_many_arguments)]
+    fn toggle_with_flyout(
+        &self,
+        id: &'static str,
+        icon_name: &str,
+        on: bool,
+        tip: &'static str,
+        action: fn() -> Box<dyn gpui::Action>,
+        flyout: Flyout,
+        menu: impl FnOnce(&Self, &mut Context<Self>) -> gpui::AnyElement,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let t = &self.theme;
+        let open = self.open == Some(flyout);
+        let corner_hit = div()
+            .id(SharedString::from(format!("{id}-corner")))
+            .absolute()
+            .right(px(0.))
+            .bottom(px(0.))
+            .size(px(CORNER_HIT))
+            .child(corner(t.muted))
+            .on_click(cx.listener(move |this, _, _, cx| {
+                cx.stop_propagation();
+                this.toggle_open(flyout, cx);
+            }));
+        let mut button = icon_button(id, icon_name, BUTTON, on || open, true, t)
+            .relative()
+            .tooltip(tooltip(tip, t))
+            .child(corner_hit)
+            .on_click(move |_, window, cx| window.dispatch_action(action(), cx));
+        if open {
+            let menu = menu(self, cx);
+            let close = cx.listener(|this, _, _, cx| this.set_open(None, cx));
+            button = button.children(popover_layer((BUTTON + 4., 0.), menu, close, window));
+        }
+        button
+    }
+
+    fn magnet_flyout(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let t = &self.theme;
+        let mode = self.snap.magnet_mode;
+        let mut menu = menu_box(t).min_w(px(240.));
+        for (id, icon_name, label, m) in [
+            ("magnet-weak", "magnet_weak", "Weak magnet", MagnetMode::Weak),
+            ("magnet-strong", "magnet_strong", "Strong magnet", MagnetMode::Strong),
+        ] {
+            let row = menu_row(id, Some(icon_name), label, false, true, t)
+                .child(div().flex_1())
+                .when(mode == m, |r| r.child(check(t)))
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    this.set_open(None, cx);
+                    window.dispatch_action(Box::new(SetMagnetMode(m)), cx);
+                }));
+            menu = menu.child(row);
+        }
+        menu.child(menu_sep(t))
+            .child(
+                div()
+                    .id("snap-indicators")
+                    .flex()
+                    .items_center()
+                    .h(px(36.))
+                    .px(px(12.))
+                    .text_size(px(14.))
+                    .tooltip(tooltip(TOOLTIP_COMING_SOON, t))
+                    .child(div().opacity(DISABLED_OPACITY).child("Snap to indicators"))
+                    .child(div().flex_1().min_w(px(16.)))
+                    .child(switch(false, false, t)),
+            )
+            .into_any_element()
+    }
+
+    fn eye_flyout(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let t = &self.theme;
+        let n = self.snap.hidden_count;
+        let show_label = if n == 1 {
+            "Show 1 hidden drawing".to_string()
+        } else {
+            format!("Show {n} hidden drawings")
+        };
+        let show = menu_row("eye-show-hidden", Some("eye"), show_label, false, n > 0, t)
+            .when(n > 0, |r| {
+                r.on_click(cx.listener(|this, _, window, cx| {
+                    this.set_open(None, cx);
+                    window.dispatch_action(Box::new(UnhideAllDrawings), cx);
+                }))
+            });
+        menu_box(t)
+            .min_w(px(240.))
+            .child(
+                menu_row("eye-hide-all", Some("eye"), "Hide all drawings", false, true, t)
+                    .child(div().flex_1().min_w(px(16.)))
+                    .child(switch(self.snap.hidden, true, t))
+                    .on_click(|_, window, cx| {
+                        window.dispatch_action(Box::new(ToggleHideDrawings), cx)
+                    }),
+            )
+            .child(show)
+            .into_any_element()
+    }
+}
+
+/// A check mark for the current choice in a menu.
+fn check(t: &AppTheme) -> impl IntoElement {
+    div().text_color(t.accent).text_size(px(15.)).child("✓")
+}
+
+/// A full-width separator inside a menu.
+fn menu_sep(t: &AppTheme) -> impl IntoElement {
+    div().h(px(1.)).mx(px(8.)).my(px(4.)).bg(t.border)
+}
+
+/// An on/off switch (display only; the row handles the click).
+fn switch(on: bool, enabled: bool, t: &AppTheme) -> impl IntoElement {
+    let knob = SWITCH_H - 4.;
+    div()
+        .flex_none()
+        .flex()
+        .items_center()
+        .w(px(SWITCH_W))
+        .h(px(SWITCH_H))
+        .px(px(2.))
+        .rounded(px(SWITCH_H / 2.))
+        .bg(if on { t.accent } else { t.border })
+        .when(on, |d| d.justify_end())
+        .when(!enabled, |d| d.opacity(DISABLED_OPACITY))
+        .child(div().size(px(knob)).rounded(px(knob / 2.)).bg(t.bg))
 }
 
 /// The small triangle in a group button's bottom-right corner.
@@ -261,21 +425,46 @@ impl Render for LeftToolbar {
             .child(self.placeholder("measure", "measure", false))
             .child(self.placeholder("zoom", "zoom", false))
             .child(hsep(30., &t))
-            .child(
-                self.toggle("magnet", "magnet", s.magnet, "Magnet: snap to OHLC", || {
-                    Box::new(ToggleMagnet)
-                }),
-            )
+            .child(self.toggle_with_flyout(
+                "magnet",
+                match s.magnet_mode {
+                    MagnetMode::Weak => "magnet_weak",
+                    MagnetMode::Strong => "magnet_strong",
+                },
+                s.magnet,
+                match s.magnet_mode {
+                    MagnetMode::Weak => "Weak magnet",
+                    MagnetMode::Strong => "Strong magnet",
+                },
+                || Box::new(ToggleMagnet),
+                Flyout::Magnet,
+                Self::magnet_flyout,
+                window,
+                cx,
+            ))
+            .child(self.toggle(
+                "stay",
+                "pencil_lock",
+                s.stay,
+                "Stay in drawing mode",
+                || Box::new(ToggleStayInDrawingMode),
+            ))
             .child(
                 self.toggle("lock", "lock", s.locked, "Lock all drawings", || {
                     Box::new(ToggleLockDrawings)
                 }),
             )
-            .child(
-                self.toggle("eye", "eye", s.hidden, "Hide all drawings", || {
-                    Box::new(ToggleHideDrawings)
-                }),
-            )
+            .child(self.toggle_with_flyout(
+                "eye",
+                "eye",
+                s.hidden,
+                "Hide all drawings",
+                || Box::new(ToggleHideDrawings),
+                Flyout::Eye,
+                Self::eye_flyout,
+                window,
+                cx,
+            ))
             .child(hsep(30., &t))
             .child(
                 self.toggle("trash", "trash", false, "Remove all drawings", || {
@@ -293,6 +482,7 @@ mod tests {
     fn every_drawing_tool_is_in_one_group() {
         for tool in [
             Tool::TrendLine,
+            Tool::ExtendedLine,
             Tool::Ray,
             Tool::HorizontalLine,
             Tool::VerticalLine,

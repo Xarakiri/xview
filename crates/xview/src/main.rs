@@ -1,15 +1,21 @@
 mod assets;
 mod bottom_bar;
 mod chart_view;
+mod color_picker;
+mod context_menu;
 #[cfg(debug_assertions)]
 mod debug_script;
 mod demo;
+mod drawing_settings;
+mod drawing_toolbar;
+mod form;
 mod left_toolbar;
 mod loader;
 mod persistence;
 mod side_panel;
-mod style_bar;
 mod symbol_search;
+mod templates_menu;
+mod text_input;
 mod theme;
 mod top_bar;
 mod widgets;
@@ -46,6 +52,7 @@ fn main() {
             gpui_tokio::init(cx);
             chart_view::bind_keys(cx);
             workspace::bind_keys(cx);
+            drawing_settings::bind_keys(cx);
             cx.on_action(|_: &Quit, cx| cx.quit());
             set_menus(cx);
 

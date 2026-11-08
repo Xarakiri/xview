@@ -10,27 +10,29 @@ use std::{
 
 use gpui::{
     App, Bounds, ContentMask, Context, DispatchPhase, EventEmitter, FocusHandle, Focusable, Font,
-    FontWeight, Hitbox, HitboxBehavior, Hsla, KeyBinding, KeyDownEvent, Keystroke, Modifiers, MouseButton, MouseDownEvent,
-    MouseExitEvent, MouseMoveEvent, MouseUpEvent, PathBuilder, PinchEvent, Pixels, Point, Render,
-    ScrollDelta, ScrollEvent, SharedString, Subscription, TextRun, Window, actions, canvas, div,
+    FontStyle, FontWeight, Hitbox, HitboxBehavior, Hsla, KeyBinding, KeyDownEvent, Keystroke, Modifiers, ModifiersChangedEvent, MouseButton, MouseDownEvent,
+    MouseExitEvent, MouseMoveEvent, MouseUpEvent, PathBuilder, PathStyle, PinchEvent, Pixels, Point, Render,
+    ScrollDelta, ScrollEvent, SharedString, StrokeOptions, Subscription, TextRun, Window, actions, canvas, div,
     fill, point, prelude::*, px, quad, size, transparent_black,
 };
 use xv_chart::{
-    ChartColors, ChartEffect, ChartKey, ChartLayout, ChartState, Frame, Legend, Mods, Prim, RectF,
-    TextAlign,
+    ChartColors, ChartEffect, ChartKey, ChartLayout, ChartState, DEFAULT_TEXT_SIZE, Dash, Frame,
+    Legend, Mods, Prim, RectF, TextAlign, clamp_span,
 };
+use lyon_tessellation::LineCap;
+use xv_drawings::DrawingId;
 use xv_core::{Candle, Series};
 
 use crate::theme::u32_to_hsla;
 
-actions!(chart, [Delete, Cancel, Undo, Redo]);
+actions!(chart, [Delete, Cancel, Undo, Redo, CopyDrawing, PasteDrawing, CloneDrawing]);
 
 /// Key context of the chart; the chart key bindings only apply inside it.
 pub const KEY_CONTEXT: &str = "ChartView";
 
 /// Pixels per line for `ScrollDelta::Lines` (mouse wheels).
 const LINE_SCROLL_PX: f32 = 20.0;
-const AXIS_FONT_SIZE: f32 = 12.0;
+const AXIS_FONT_SIZE: f32 = DEFAULT_TEXT_SIZE;
 const TITLE_FONT_SIZE: f32 = 14.0;
 /// Line box used to vertically center axis text on its anchor.
 const TEXT_LINE_HEIGHT: f32 = 16.0;
@@ -38,9 +40,17 @@ const TEXT_LINE_HEIGHT: f32 = 16.0;
 const LABEL_HEIGHT: f32 = xv_chart::AXIS_LABEL_HEIGHT;
 const LABEL_PAD_X: f32 = 4.0;
 const LABEL_RADIUS: f32 = 3.0;
+/// Gap kept between clamped drawing text and the plot edge.
+const TEXT_CLAMP_PAD: f32 = 2.0;
 const HANDLE_RADIUS: f32 = 4.5;
 const HANDLE_BORDER: f32 = 1.5;
-const DASH: [f32; 2] = [4.0, 4.0];
+/// Crosshair and last-price lines.
+const GUIDE_DASH: [f32; 2] = [4.0, 4.0];
+/// Drawing line styles. Dots have round caps, so each "on" segment paints
+/// as a dot; the dot pattern is scaled by the line width so thick dotted
+/// lines keep their gaps (a 1 px line: 2 px dots, 2 px gaps).
+const DRAWING_DASH: [f32; 2] = [6.0, 4.0];
+const DRAWING_DOT: [f32; 2] = [1.0, 3.0];
 const LEGEND_X: f32 = 10.0;
 const LEGEND_Y: f32 = 16.0;
 const LEGEND_GAP: f32 = 12.0;
@@ -55,6 +65,9 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("escape", Cancel, ctx),
         KeyBinding::new("cmd-z", Undo, ctx),
         KeyBinding::new("cmd-shift-z", Redo, ctx),
+        KeyBinding::new("cmd-c", CopyDrawing, ctx),
+        KeyBinding::new("cmd-v", PasteDrawing, ctx),
+        KeyBinding::new("cmd-d", CloneDrawing, ctx),
     ]);
 }
 
@@ -67,6 +80,19 @@ pub enum ChartViewEvent {
     /// A letter was typed while the chart had focus: open the symbol search
     /// pre-filled with it.
     TypeToSearch(String),
+    /// Right-click on a drawing (now selected); `position` is in window
+    /// coordinates.
+    ContextMenu {
+        id: DrawingId,
+        position: Point<Pixels>,
+    },
+    /// Double-click on a drawing: open its settings.
+    OpenSettings(DrawingId),
+    /// `ChartState::tool_styles` changed.
+    ToolStylesChanged,
+    /// Esc while a drawing-toolbar popover is open: close it instead of
+    /// deselecting.
+    DismissPopover,
 }
 
 pub struct ChartView {
@@ -77,6 +103,16 @@ pub struct ChartView {
     /// A left-button press started on the chart and has not been released, so
     /// moves and the release are forwarded even outside the canvas.
     dragging: bool,
+    /// The pointer is over the canvas, so modifier changes are forwarded.
+    hovered: bool,
+    /// Window position of the canvas origin, from the last prepaint.
+    origin: Point<Pixels>,
+    /// A drawing-toolbar popover is open, so Esc closes it (set by the
+    /// toolbar).
+    pub popover_open: bool,
+    /// The drawing settings dialog is open (set by the workspace): the chart
+    /// takes no shortcuts.
+    pub modal_open: bool,
     /// Element size last passed to `ChartState::set_size`.
     size: Option<(f32, f32)>,
     stats: Option<Rc<RefCell<FrameStats>>>,
@@ -103,8 +139,11 @@ impl ChartView {
         let state = ChartState::new(series, 0.0, 0.0);
         let activation = cx.observe_window_activation(window, |this, window, cx| {
             if !window.is_window_active() {
+                // Modifier releases are not seen while inactive (cmd-tab).
+                let fx = this.state.modifiers_changed(Mods::default());
                 this.state.mouse_left();
-                cx.notify();
+                this.hovered = false;
+                this.apply_effects(fx, cx);
             }
         });
         let stats = std::env::var_os("XVIEW_FRAME_LOG")
@@ -116,6 +155,10 @@ impl ChartView {
             focus: cx.focus_handle(),
             colors,
             dragging: false,
+            hovered: false,
+            origin: Point::default(),
+            popover_open: false,
+            modal_open: false,
             size: None,
             stats,
             _activation: activation,
@@ -125,9 +168,9 @@ impl ChartView {
     /// Replaces the series (the loader landed a new symbol or timeframe).
     pub fn set_series(&mut self, s: Series, cx: &mut Context<Self>) {
         self.dragging = false;
-        self.state.set_series(s);
+        let mut fx = self.state.set_series(s);
         // A wide window may already show the left edge of the first page.
-        let fx = self.state.check_need_older();
+        fx.extend(self.state.check_need_older());
         self.apply_effects(fx, cx);
     }
 
@@ -179,14 +222,45 @@ impl ChartView {
                 ChartEffect::DrawingsChanged => ChartViewEvent::DrawingsChanged,
                 ChartEffect::ToolFinished => ChartViewEvent::ToolFinished,
                 ChartEffect::SelectionChanged => ChartViewEvent::SelectionChanged,
+                ChartEffect::OpenSettings(id) => ChartViewEvent::OpenSettings(id),
+                ChartEffect::ToolStylesChanged => ChartViewEvent::ToolStylesChanged,
             });
         }
         cx.notify();
     }
 
+    /// Edit shortcuts are swallowed while a toolbar popover or the settings
+    /// dialog is open.
+    pub fn input_blocked(&self) -> bool {
+        self.popover_open || self.modal_open
+    }
+
+    /// Window position of the chart element's origin.
+    pub fn origin(&self) -> Point<Pixels> {
+        self.origin
+    }
+
     fn key(&mut self, k: ChartKey, cx: &mut Context<Self>) {
         let fx = self.state.key(k);
         self.apply_effects(fx, cx);
+    }
+
+    /// Right-click at `p` (element coordinates): selects the drawing under it
+    /// (or deselects) and asks for its context menu.
+    pub fn right_click(&mut self, p: (f32, f32), cx: &mut Context<Self>) {
+        let (id, fx) = self.state.select_at(p);
+        self.apply_effects(fx, cx);
+        if let Some(id) = id {
+            let position = self.origin + point(px(p.0), px(p.1));
+            cx.emit(ChartViewEvent::ContextMenu { id, position });
+        }
+    }
+
+    fn modifiers_changed(&mut self, m: &Modifiers, cx: &mut Context<Self>) {
+        if self.hovered || self.dragging {
+            let fx = self.state.modifiers_changed(mods(m));
+            self.apply_effects(fx, cx);
+        }
     }
 
     /// Prepaint: syncs the size and builds the frame.
@@ -195,6 +269,7 @@ impl ChartView {
         bounds: Bounds<Pixels>,
         cx: &mut Context<Self>,
     ) -> (Frame, ChartColors, ChartLayout) {
+        self.origin = bounds.origin;
         let sz = (f32::from(bounds.size.width), f32::from(bounds.size.height));
         if self.size != Some(sz) {
             self.size = Some(sz);
@@ -258,11 +333,49 @@ impl Render for ChartView {
         div()
             .key_context(KEY_CONTEXT)
             .track_focus(&self.focus)
-            .on_action(cx.listener(|this, _: &Delete, _, cx| this.key(ChartKey::Delete, cx)))
-            .on_action(cx.listener(|this, _: &Cancel, _, cx| this.key(ChartKey::Escape, cx)))
-            .on_action(cx.listener(|this, _: &Undo, _, cx| this.key(ChartKey::Undo, cx)))
-            .on_action(cx.listener(|this, _: &Redo, _, cx| this.key(ChartKey::Redo, cx)))
-            .on_key_down(cx.listener(|_, e: &KeyDownEvent, _, cx| {
+            // While a toolbar popover is open, edit shortcuts are swallowed:
+            // they would change the drawing under an open picker session.
+            .on_action(cx.listener(|this, _: &Delete, _, cx| {
+                if !this.input_blocked() {
+                    this.key(ChartKey::Delete, cx)
+                }
+            }))
+            .on_action(cx.listener(|this, _: &Cancel, _, cx| {
+                if this.modal_open {
+                    return;
+                }
+                if this.popover_open {
+                    cx.emit(ChartViewEvent::DismissPopover);
+                } else {
+                    this.key(ChartKey::Escape, cx)
+                }
+            }))
+            .on_action(cx.listener(|this, _: &Undo, _, cx| {
+                if !this.input_blocked() {
+                    this.key(ChartKey::Undo, cx)
+                }
+            }))
+            .on_action(cx.listener(|this, _: &Redo, _, cx| {
+                if !this.input_blocked() {
+                    this.key(ChartKey::Redo, cx)
+                }
+            }))
+            .on_action(cx.listener(|this, _: &CloneDrawing, _, cx| {
+                if this.input_blocked() {
+                    return;
+                }
+                let fx = this.state.clone_selected();
+                this.apply_effects(fx, cx);
+            }))
+            // Modifier events go to the focused path, which the canvas below
+            // is not on, so the listener sits here.
+            .on_modifiers_changed(cx.listener(|this, e: &ModifiersChangedEvent, _, cx| {
+                this.modifiers_changed(&e.modifiers, cx)
+            }))
+            .on_key_down(cx.listener(|this, e: &KeyDownEvent, _, cx| {
+                if this.input_blocked() {
+                    return;
+                }
                 if let Some(letter) = type_to_search_letter(&e.keystroke) {
                     cx.stop_propagation();
                     cx.emit(ChartViewEvent::TypeToSearch(letter));
@@ -288,6 +401,15 @@ impl Render for ChartView {
                         let Some(prepared) = prepared else { return };
                         let t0 = Instant::now();
                         paint_frame(bounds, &prepared, window, cx);
+                        // The pointer may rest on the chart since before the
+                        // first mouse move (e.g. at launch, or after a popover
+                        // closed): take the hover from the hitbox so a cmd /
+                        // shift press snaps at once. GPUI's hit test is only
+                        // current from paint on, so this is not in prepaint.
+                        // Only ever set here; moves and exits clear it.
+                        if prepared.hitbox.is_hovered(window) {
+                            let _ = paint_view.update(cx, |this, _| this.hovered = true);
+                        }
                         register_input(bounds, &prepared.hitbox, &paint_view, window);
                         if let Some(stats) = &stats {
                             let prims = prepared.frame.plot.len()
@@ -319,6 +441,7 @@ fn paint_frame(bounds: Bounds<Pixels>, p: &Prepared, window: &mut Window, cx: &m
         scale: window.scale_factor(),
         font: window.text_style().font(),
         background: u32_to_hsla(p.colors.background),
+        plot: p.layout.plot,
     };
     let c = &p.colors;
     let l = &p.layout;
@@ -341,7 +464,7 @@ fn paint_frame(bounds: Bounds<Pixels>, p: &Prepared, window: &mut Window, cx: &m
         (px_, py_ + l.time_axis.h),
         sep,
         1.0,
-        false,
+        Dash::Solid,
         window,
     );
     painter.line(
@@ -349,7 +472,7 @@ fn paint_frame(bounds: Bounds<Pixels>, p: &Prepared, window: &mut Window, cx: &m
         (px_ + l.price_axis.w, py_),
         sep,
         1.0,
-        false,
+        Dash::Solid,
         window,
     );
 
@@ -372,11 +495,22 @@ fn paint_frame(bounds: Bounds<Pixels>, p: &Prepared, window: &mut Window, cx: &m
     });
 }
 
+/// Color, font and size of one `Prim::Text`.
+struct TextLook<'a> {
+    color: Hsla,
+    font: &'a Font,
+    size: f32,
+    /// Keep the text and its background inside the plot.
+    clamp: bool,
+}
+
 struct Painter {
     origin: Point<Pixels>,
     scale: f32,
     font: Font,
     background: Hsla,
+    /// Plot rect (element coordinates), for clamped text.
+    plot: RectF,
 }
 
 impl Painter {
@@ -431,26 +565,60 @@ impl Painter {
                 b,
                 color,
                 width,
-                dashed,
-            } => self.line(*a, *b, u32_to_hsla(*color), *width, *dashed, window),
+                dash,
+            } => self.line(*a, *b, u32_to_hsla(*color), *width, *dash, window),
             Prim::Text {
                 pos,
                 text,
                 color,
                 align,
                 bg,
+                size,
+                bold,
+                italic,
+                clamp,
             } => {
+                let mut font = self.font.clone();
+                if *bold {
+                    font.weight = FontWeight::SEMIBOLD;
+                }
+                if *italic {
+                    font.style = FontStyle::Italic;
+                }
                 self.text(
                     *pos,
                     text,
-                    u32_to_hsla(*color),
+                    TextLook {
+                        color: u32_to_hsla(*color),
+                        font: &font,
+                        size: *size,
+                        clamp: *clamp,
+                    },
                     *align,
                     bg.map(u32_to_hsla),
                     window,
                     cx,
                 );
             }
-            Prim::Handle { center, color } => {
+            Prim::Polygon { pts, color } => {
+                let Some((first, rest)) = pts.split_first() else {
+                    return;
+                };
+                let mut p = PathBuilder::fill();
+                p.move_to(self.at(*first));
+                for q in rest {
+                    p.line_to(self.at(*q));
+                }
+                p.close();
+                if let Ok(path) = p.build() {
+                    window.paint_path(path, u32_to_hsla(*color));
+                }
+            }
+            Prim::Handle {
+                center,
+                color,
+                filled,
+            } => {
                 let r = HANDLE_RADIUS;
                 window.paint_quad(quad(
                     Bounds {
@@ -458,8 +626,13 @@ impl Painter {
                         size: size(px(2. * r), px(2. * r)),
                     },
                     px(r),
-                    // Hollow handle: chart background inside, colored ring.
-                    self.background,
+                    // Chart background inside a colored ring; a locked
+                    // drawing's handles are just the ring.
+                    if *filled {
+                        self.background
+                    } else {
+                        transparent_black()
+                    },
                     px(HANDLE_BORDER),
                     u32_to_hsla(*color),
                     Default::default(),
@@ -474,13 +647,13 @@ impl Painter {
         b: (f32, f32),
         color: Hsla,
         width: f32,
-        dashed: bool,
+        dash: Dash,
         window: &mut Window,
     ) {
         let (mut a, mut b) = (a, b);
         let vertical = a.0 == b.0;
         let horizontal = a.1 == b.1;
-        if !dashed && (vertical || horizontal) {
+        if dash == Dash::Solid && (vertical || horizontal) {
             // Axis-aligned solid lines are quads: crisp and far cheaper than
             // tessellated paths (every candle wick takes this path).
             let (c, w) = self.snap_line(if vertical { a.0 } else { a.1 }, width);
@@ -502,8 +675,22 @@ impl Painter {
             (a.1, b.1) = (c, c);
         }
         let mut builder = PathBuilder::stroke(px(width));
-        if dashed {
-            builder = builder.dash_array(&[px(DASH[0]), px(DASH[1])]);
+        let scaled = |d: [f32; 2]| [px(d[0] * width.max(1.0)), px(d[1] * width.max(1.0))];
+        match dash {
+            Dash::Solid => {}
+            Dash::Guide => builder = builder.dash_array(&[px(GUIDE_DASH[0]), px(GUIDE_DASH[1])]),
+            Dash::Dashed => {
+                builder = builder.dash_array(&[px(DRAWING_DASH[0]), px(DRAWING_DASH[1])])
+            }
+            Dash::Dotted => {
+                builder = builder
+                    .with_style(PathStyle::Stroke(
+                        StrokeOptions::default()
+                            .with_line_width(width)
+                            .with_line_cap(LineCap::Round),
+                    ))
+                    .dash_array(&scaled(DRAWING_DOT));
+            }
         }
         builder.move_to(self.at(a));
         builder.line_to(self.at(b));
@@ -544,7 +731,7 @@ impl Painter {
         &self,
         pos: (f32, f32),
         text: &str,
-        color: Hsla,
+        look: TextLook,
         align: TextAlign,
         bg: Option<Hsla>,
         window: &mut Window,
@@ -553,19 +740,22 @@ impl Painter {
         if text.is_empty() {
             return;
         }
-        let line = self.shape(
-            text,
-            &self.font,
-            AXIS_FONT_SIZE,
-            &[(text.len(), color)],
-            window,
-        );
+        let line = self.shape(text, look.font, look.size, &[(text.len(), look.color)], window);
+        let line_h = TEXT_LINE_HEIGHT.max(look.size * 1.25);
         let w = f32::from(line.width());
-        let x = match align {
+        let mut x = match align {
             TextAlign::Left => pos.0,
             TextAlign::Center => pos.0 - w / 2.0,
             TextAlign::Right => pos.0 - w,
         };
+        let mut pos = pos;
+        if look.clamp {
+            let pl = &self.plot;
+            let pad = if bg.is_some() { LABEL_PAD_X } else { 0.0 } + TEXT_CLAMP_PAD;
+            x = clamp_span(x - pad, w + 2.0 * pad, pl.x, pl.x + pl.w) + pad;
+            let h = if bg.is_some() { line_h.max(LABEL_HEIGHT) } else { line_h };
+            pos.1 = clamp_span(pos.1 - h / 2.0, h, pl.y, pl.y + pl.h) + h / 2.0;
+        }
         if let Some(bg) = bg {
             let (bx, by) = (x - LABEL_PAD_X, pos.1 - LABEL_HEIGHT / 2.0);
             window.paint_quad(
@@ -577,8 +767,8 @@ impl Painter {
             );
         }
         let _ = line.paint(
-            self.at((x, pos.1 - TEXT_LINE_HEIGHT / 2.0)),
-            px(TEXT_LINE_HEIGHT),
+            self.at((x, pos.1 - line_h / 2.0)),
+            px(line_h),
             gpui::TextAlign::Left,
             None,
             window,
@@ -675,12 +865,28 @@ fn register_input(
     }
     {
         let (view, hitbox) = (view.clone(), hitbox.clone());
+        window.on_mouse_event(move |e: &MouseDownEvent, phase, window, cx| {
+            if phase != DispatchPhase::Bubble
+                || e.button != MouseButton::Right
+                || !hitbox.is_hovered(window)
+            {
+                return;
+            }
+            let _ = view.update(cx, |this, cx| {
+                window.focus(&this.focus, cx);
+                this.right_click(rel(e.position), cx);
+            });
+        });
+    }
+    {
+        let (view, hitbox) = (view.clone(), hitbox.clone());
         window.on_mouse_event(move |e: &MouseMoveEvent, phase, window, cx| {
             if phase != DispatchPhase::Bubble {
                 return;
             }
             let hovered = hitbox.is_hovered(window);
             let _ = view.update(cx, |this, cx| {
+                this.hovered = hovered;
                 if this.dragging || hovered {
                     let pressed = e.pressed_button == Some(MouseButton::Left);
                     if !pressed {
@@ -722,6 +928,7 @@ fn register_input(
                 return;
             }
             let _ = view.update(cx, |this, cx| {
+                this.hovered = false;
                 this.state.mouse_left();
                 cx.notify();
             });

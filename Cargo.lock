@@ -6507,6 +6507,7 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror 2.0.21",
+ "xv_core",
 ]
 
 [[package]]
@@ -6555,6 +6556,7 @@ dependencies = [
  "gpui",
  "gpui_platform",
  "gpui_tokio",
+ "lyon_tessellation",
  "tempfile",
  "xv_chart",
  "xv_core",

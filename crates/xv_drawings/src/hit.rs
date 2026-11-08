@@ -188,9 +188,8 @@ impl Drawing {
             },
         };
         Drawing {
-            id: self.id,
             kind,
-            style: self.style,
+            ..self.clone()
         }
     }
 
@@ -227,9 +226,8 @@ impl Drawing {
             (k, _) => k.clone(),
         };
         Drawing {
-            id: self.id,
             kind,
-            style: self.style,
+            ..self.clone()
         }
     }
 }
@@ -261,11 +259,7 @@ mod tests {
         P.to_anchor((x, y))
     }
     fn d(id: u64, kind: DrawingKind) -> Drawing {
-        Drawing {
-            id: DrawingId(id),
-            kind,
-            style: Style::default(),
-        }
+        Drawing::new(DrawingId(id), kind, Style::default())
     }
 
     #[test]

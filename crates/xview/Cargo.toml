@@ -18,6 +18,8 @@ xv_data = { path = "../xv_data" }
 xv_source_binance = { path = "../xv_source_binance" }
 xv_source_csv = { path = "../xv_source_csv" }
 futures.workspace = true
+# Round line caps for dotted drawing lines (the version GPUI already uses).
+lyon_tessellation = "1.0"
 
 [dev-dependencies]
 tempfile.workspace = true
