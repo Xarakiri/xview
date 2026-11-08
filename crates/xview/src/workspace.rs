@@ -1157,6 +1157,13 @@ impl Workspace {
     /// Writes everything pending: on quit and window close.
     fn flush_all(&mut self, cx: &mut Context<Self>) {
         self.bounds_save = None;
+        // An open settings dialog's preview is not a committed edit: put
+        // the original back and queue that (the change events would only
+        // arrive after the flush).
+        if self.close_drawing_settings(cx) {
+            self.schedule_drawings_save(cx);
+            self.schedule_templates_save(cx);
+        }
         self.flush_drawings(cx);
         if let Err(e) = self.persistence.flush_templates() {
             self.report_templates_error(e, cx);

@@ -405,9 +405,13 @@ impl DrawingSettings {
                     false,
                     cx,
                 );
-                subs.push(cx.subscribe(&f, move |this, f, e: &TextInputEvent, cx| {
-                    this.on_time(i, &f, e, cx)
-                }));
+                subs.push(cx.subscribe_in(
+                    &f,
+                    window,
+                    move |this, f, e: &TextInputEvent, window, cx| {
+                        this.on_time(i, f, e, window, cx)
+                    },
+                ));
                 subs.push(cx.on_blur(&f.focus_handle(cx), window, |this, window, cx| {
                     this.reformat(window, cx)
                 }));
@@ -683,14 +687,21 @@ impl DrawingSettings {
         i: usize,
         f: &Entity<TextInput>,
         e: &TextInputEvent,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if let TextInputEvent::Changed(t) = e {
-            let ms = parse_datetime(t, self.tz);
-            f.update(cx, |f, cx| f.set_invalid(ms.is_none(), cx));
-            if let Some(ms) = ms {
-                self.edit(|d| set_anchor_time(&mut d.kind, i, ms), cx);
+        match e {
+            TextInputEvent::Changed(t) => {
+                let ms = parse_datetime(t, self.tz);
+                f.update(cx, |f, cx| f.set_invalid(ms.is_none(), cx));
+                if let Some(ms) = ms {
+                    self.edit(|d| set_anchor_time(&mut d.kind, i, ms), cx);
+                }
             }
+            // Valid text is already applied; leaving the field reformats it
+            // (invalid text keeps its red border).
+            TextInputEvent::Submit(_) => window.focus(&self.focus, cx),
+            TextInputEvent::Step(_) | TextInputEvent::Cancel => {}
         }
     }
 
@@ -1535,7 +1546,7 @@ impl DrawingSettings {
                 if k.starts_with("price") {
                     self.on_price(i, &f, &e, window, cx);
                 } else {
-                    self.on_time(i, &f, &e, cx);
+                    self.on_time(i, &f, &e, window, cx);
                 }
             }
             "vis" => {

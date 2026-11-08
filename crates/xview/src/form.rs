@@ -6,7 +6,7 @@
 use std::cell::Cell;
 use std::rc::Rc;
 
-use chrono::{NaiveDate, NaiveDateTime};
+use chrono::NaiveDateTime;
 use gpui::{
     App, Bounds, Div, ElementId, FontWeight, Pixels, SharedString, Stateful, Window, canvas, div,
     prelude::*, px,
@@ -50,10 +50,13 @@ pub fn format_field_price(p: f64, tick: f64) -> String {
     format!("{:.*}", xv_chart::decimals_of(valid_tick(tick)), p)
 }
 
-/// `p` moved `dir` ticks, on the tick grid.
+/// `p` moved `dir` ticks, on the tick grid, rounded to the tick's decimals
+/// (so 0.1 + 0.2 is stored as 0.3, not 0.30000000000000004).
 pub fn step_price(p: f64, tick: f64, dir: i32) -> f64 {
     let tick = valid_tick(tick);
-    ((p / tick).round() + dir as f64) * tick
+    let raw = ((p / tick).round() + dir as f64) * tick;
+    let scale = 10f64.powi(xv_chart::decimals_of(tick) as i32);
+    (raw * scale).round() / scale
 }
 
 /// `YYYY-MM-DD HH:MM` of `ms` in `tz`.
@@ -65,16 +68,22 @@ pub fn format_datetime(ms: i64, tz: TzOffset) -> String {
         .to_string()
 }
 
-/// The instant of `YYYY-MM-DD HH:MM` (or `YYYY-MM-DD`, as 00:00) in `tz`.
+/// The instant of a complete `YYYY-MM-DD HH:MM` (two-digit month, day,
+/// hour and minute; year 1970–9999) in `tz`. Anything else, including a
+/// partly typed value, is `None`.
 pub fn parse_datetime(s: &str, tz: TzOffset) -> Option<i64> {
     let s = s.trim();
-    let naive = NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M")
-        .ok()
-        .or_else(|| {
-            NaiveDate::parse_from_str(s, "%Y-%m-%d")
-                .ok()
-                .and_then(|d| d.and_hms_opt(0, 0, 0))
-        })?;
+    let shape = s.len() == 16
+        && s.bytes().enumerate().all(|(i, b)| match i {
+            4 | 7 => b == b'-',
+            10 => b == b' ',
+            13 => b == b':',
+            _ => b.is_ascii_digit(),
+        });
+    if !shape || s[..4].parse::<i32>().ok()? < 1970 {
+        return None;
+    }
+    let naive = NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M").ok()?;
     Some(naive.and_utc().timestamp_millis() - tz.seconds as i64 * 1000)
 }
 
@@ -369,13 +378,19 @@ mod tests {
             parse_datetime(&format_datetime(ms, minus5), minus5),
             Some(ms)
         );
-        // A date alone is local midnight.
-        assert_eq!(
-            parse_datetime("2026-11-07", plus3),
-            Some(1_794_009_600_000 - 3 * 3_600_000)
-        );
         assert_eq!(parse_datetime(" 2026-11-07 16:40 ", plus3), Some(ms));
+        // The year range ends are accepted.
+        assert_eq!(parse_datetime("1970-01-01 00:00", TzOffset::UTC), Some(0));
+        assert!(parse_datetime("9999-12-31 23:59", TzOffset::UTC).is_some());
         for bad in [
+            "2026-02-30 10:00",
+            "2026-11-07",
+            "2026-11-07 6:40",
+            "2026-11-07 16:4",
+            "2026-1-07 16:40",
+            "1969-12-31 23:59",
+            "0001-01-01 00:00",
+            "+2026-11-07 16:40",
             "",
             "2026-13-01",
             "2026-11-07 25:00",
@@ -393,6 +408,12 @@ mod tests {
         // Off-grid prices snap to the grid, then step.
         assert!((step_price(1.234, 0.01, 1) - 1.24).abs() < 1e-9);
         assert_eq!(format_field_price(step_price(0.1, 0.1, 2), 0.1), "0.3");
+        // The stored value is rounded to the tick's decimals: no float noise.
+        assert_eq!(step_price(0.1, 0.1, 2), 0.3);
+        assert_eq!(step_price(0.2, 0.1, 1), 0.3);
+        assert_eq!(step_price(1.234, 0.01, 1), 1.24);
+        assert_eq!(step_price(64000.07, 0.01, -1), 64000.06);
+        assert_eq!(step_price(0.00012, 0.00001, 1), 0.00013);
         assert_eq!(format_field_price(4345.5, 0.5), "4345.5");
         assert_eq!(format_field_price(64000.0, 0.01), "64000.00");
         // A bad tick falls back to 0.01.
