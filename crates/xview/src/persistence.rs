@@ -10,6 +10,10 @@
 //! generation, and all writes go through `write_if_newer`, which holds one
 //! lock across the check and the write: an older set can never overwrite a
 //! newer one, whichever path finishes last.
+//!
+//! The drawing templates file (last-used styles) follows the same rules
+//! with a single key: a debounced background write, a synchronous flush on
+//! quit, and a generation guard so an older write never lands last.
 
 use std::collections::HashMap;
 use std::io;
@@ -20,11 +24,15 @@ use std::time::Duration;
 use gpui::{Context, Task};
 use xv_core::SymbolKey;
 use xv_drawings::Drawing;
-use xv_store::{LoadedDrawings, Settings, load_drawings, save_drawings, save_settings};
+use xv_store::{
+    LoadedDrawings, LoadedTemplates, Settings, TemplatesFile, load_drawings, load_templates,
+    save_drawings, save_settings, save_templates,
+};
 
 use crate::workspace::Workspace;
 
 pub const DRAWINGS_DEBOUNCE: Duration = Duration::from_millis(500);
+pub const TEMPLATES_DEBOUNCE: Duration = Duration::from_millis(500);
 
 /// Generation last written per key. The mutex also serializes the writes.
 type Written = Arc<Mutex<HashMap<SymbolKey, u64>>>;
@@ -39,6 +47,11 @@ pub struct Persistence {
     unsaved: HashMap<SymbolKey, (u64, Vec<Drawing>)>,
     next_gen: u64,
     written: Written,
+    templates_pending: Option<Task<()>>,
+    /// Latest unsaved templates file, with its generation.
+    templates_unsaved: Option<(u64, TemplatesFile)>,
+    /// Generation of the templates file last written; also serializes writes.
+    templates_written: Arc<Mutex<u64>>,
 }
 
 /// A failed drawings save, for the banner.
@@ -65,6 +78,22 @@ fn write_if_newer(
     Ok(())
 }
 
+/// Writes the templates file unless one at least as new was already written.
+fn write_templates_if_newer(
+    dir: &Path,
+    written: &Mutex<u64>,
+    generation: u64,
+    f: &TemplatesFile,
+) -> io::Result<()> {
+    let mut w = written.lock().unwrap_or_else(|e| e.into_inner());
+    if *w >= generation {
+        return Ok(());
+    }
+    save_templates(dir, f)?;
+    *w = generation;
+    Ok(())
+}
+
 /// Writes a batch; returns each key's generation and outcome.
 pub fn write_batch(
     dir: &Path,
@@ -88,6 +117,9 @@ impl Persistence {
             unsaved: HashMap::new(),
             next_gen: 0,
             written: Arc::default(),
+            templates_pending: None,
+            templates_unsaved: None,
+            templates_written: Arc::default(),
         }
     }
 
@@ -179,6 +211,67 @@ impl Persistence {
             Some((_, ds)) => LoadedDrawings::Ok(ds.clone()),
             None => load_drawings(&self.dir, key),
         }
+    }
+
+    pub fn load_templates(&self) -> LoadedTemplates {
+        load_templates(&self.dir)
+    }
+
+    fn queue_templates(&mut self, f: TemplatesFile) {
+        self.next_gen += 1;
+        self.templates_unsaved = Some((self.next_gen, f));
+    }
+
+    /// Queues `f` and (re)starts the debounce; the write runs in the
+    /// background. A failure keeps it queued and is shown in the banner.
+    pub fn schedule_templates_save(&mut self, f: TemplatesFile, cx: &mut Context<Workspace>) {
+        self.queue_templates(f);
+        self.templates_pending = Some(cx.spawn(async move |ws, cx| {
+            cx.background_executor().timer(TEMPLATES_DEBOUNCE).await;
+            let Ok(Some((dir, written, generation, f))) = ws.update(cx, |ws, _| {
+                let p = &ws.persistence;
+                p.templates_unsaved
+                    .clone()
+                    .map(|(g, f)| (p.dir.clone(), p.templates_written.clone(), g, f))
+            }) else {
+                return;
+            };
+            let result = cx
+                .background_executor()
+                .spawn(async move { write_templates_if_newer(&dir, &written, generation, &f) })
+                .await;
+            ws.update(cx, |ws, cx| {
+                if let Err(e) = ws.persistence.finish_templates(generation, result) {
+                    ws.report_templates_error(e, cx);
+                }
+            })
+            .ok();
+        }));
+    }
+
+    /// Records a templates write: the queued file leaves the queue once it
+    /// (and no newer one) is on disk.
+    fn finish_templates(&mut self, generation: u64, r: io::Result<()>) -> io::Result<()> {
+        r?;
+        if self
+            .templates_unsaved
+            .as_ref()
+            .is_some_and(|(g, _)| *g == generation)
+        {
+            self.templates_unsaved = None;
+        }
+        Ok(())
+    }
+
+    /// Writes a queued templates file synchronously (quit). It stays queued
+    /// on failure.
+    pub fn flush_templates(&mut self) -> io::Result<()> {
+        self.templates_pending = None;
+        let Some((generation, f)) = self.templates_unsaved.clone() else {
+            return Ok(());
+        };
+        let r = write_templates_if_newer(&self.dir, &self.templates_written, generation, &f);
+        self.finish_templates(generation, r)
     }
 
     #[cfg(test)]
@@ -296,6 +389,51 @@ mod tests {
         assert!(p.finish(results).is_empty());
         assert!(matches!(load_drawings(t.path(), &k), LoadedDrawings::Ok(ds) if ds.len() == 2));
         assert!(!p.has_unsaved());
+    }
+
+    fn templates(width: u8) -> TemplatesFile {
+        let mut f = TemplatesFile::default();
+        f.last_used.insert(
+            "trend_line".into(),
+            Style {
+                width,
+                ..Style::default()
+            },
+        );
+        f
+    }
+
+    #[test]
+    fn templates_flush_writes_and_older_write_is_a_noop() {
+        let t = tempfile::TempDir::new().unwrap();
+        let mut p = Persistence::new(t.path().to_path_buf());
+        p.queue_templates(templates(1));
+        let (stale_gen, stale) = p.templates_unsaved.clone().unwrap();
+        p.queue_templates(templates(3));
+        p.flush_templates().unwrap();
+        assert!(p.templates_unsaved.is_none());
+        // The debounced write of the older file finishes last: a no-op.
+        write_templates_if_newer(t.path(), &p.templates_written, stale_gen, &stale).unwrap();
+        match load_templates(t.path()) {
+            LoadedTemplates::Ok(f) => assert_eq!(f, templates(3)),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn refused_templates_save_stays_queued() {
+        let t = tempfile::TempDir::new().unwrap();
+        let path = xv_store::templates_path(t.path());
+        std::fs::write(&path, "{not json").unwrap();
+        let mut p = Persistence::new(t.path().to_path_buf());
+        p.queue_templates(templates(2));
+        let e = p.flush_templates().unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::InvalidData);
+        assert!(p.templates_unsaved.is_some());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "{not json");
+        std::fs::remove_file(&path).unwrap();
+        p.flush_templates().unwrap();
+        assert!(p.templates_unsaved.is_none());
     }
 
     #[test]

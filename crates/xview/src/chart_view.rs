@@ -10,20 +10,21 @@ use std::{
 
 use gpui::{
     App, Bounds, ContentMask, Context, DispatchPhase, EventEmitter, FocusHandle, Focusable, Font,
-    FontStyle, FontWeight, Hitbox, HitboxBehavior, Hsla, KeyBinding, KeyDownEvent, Keystroke, Modifiers, MouseButton, MouseDownEvent,
+    FontStyle, FontWeight, Hitbox, HitboxBehavior, Hsla, KeyBinding, KeyDownEvent, Keystroke, Modifiers, ModifiersChangedEvent, MouseButton, MouseDownEvent,
     MouseExitEvent, MouseMoveEvent, MouseUpEvent, PathBuilder, PinchEvent, Pixels, Point, Render,
     ScrollDelta, ScrollEvent, SharedString, Subscription, TextRun, Window, actions, canvas, div,
     fill, point, prelude::*, px, quad, size, transparent_black,
 };
 use xv_chart::{
     ChartColors, ChartEffect, ChartKey, ChartLayout, ChartState, DEFAULT_TEXT_SIZE, Dash, Frame,
-    Legend, MagnetMode, Mods, Prim, RectF, TextAlign, clamp_span,
+    Legend, Mods, Prim, RectF, TextAlign, clamp_span,
 };
+use xv_drawings::DrawingId;
 use xv_core::{Candle, Series};
 
 use crate::theme::u32_to_hsla;
 
-actions!(chart, [Delete, Cancel, Undo, Redo]);
+actions!(chart, [Delete, Cancel, Undo, Redo, CopyDrawing, PasteDrawing, CloneDrawing]);
 
 /// Key context of the chart; the chart key bindings only apply inside it.
 pub const KEY_CONTEXT: &str = "ChartView";
@@ -58,6 +59,9 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("escape", Cancel, ctx),
         KeyBinding::new("cmd-z", Undo, ctx),
         KeyBinding::new("cmd-shift-z", Redo, ctx),
+        KeyBinding::new("cmd-c", CopyDrawing, ctx),
+        KeyBinding::new("cmd-v", PasteDrawing, ctx),
+        KeyBinding::new("cmd-d", CloneDrawing, ctx),
     ]);
 }
 
@@ -70,6 +74,16 @@ pub enum ChartViewEvent {
     /// A letter was typed while the chart had focus: open the symbol search
     /// pre-filled with it.
     TypeToSearch(String),
+    /// Right-click on a drawing (now selected); `position` is in window
+    /// coordinates.
+    ContextMenu {
+        id: DrawingId,
+        position: Point<Pixels>,
+    },
+    /// Double-click on a drawing: open its settings.
+    OpenSettings(DrawingId),
+    /// `ChartState::tool_styles` changed.
+    ToolStylesChanged,
 }
 
 pub struct ChartView {
@@ -80,6 +94,10 @@ pub struct ChartView {
     /// A left-button press started on the chart and has not been released, so
     /// moves and the release are forwarded even outside the canvas.
     dragging: bool,
+    /// The pointer is over the canvas, so modifier changes are forwarded.
+    hovered: bool,
+    /// Window position of the canvas origin, from the last prepaint.
+    origin: Point<Pixels>,
     /// Element size last passed to `ChartState::set_size`.
     size: Option<(f32, f32)>,
     stats: Option<Rc<RefCell<FrameStats>>>,
@@ -103,13 +121,14 @@ impl ChartView {
         cx: &mut Context<Self>,
     ) -> Self {
         // The real size arrives in the first prepaint.
-        let mut state = ChartState::new(series, 0.0, 0.0);
-        // Until the magnet mode can be chosen, "magnet on" keeps snapping always.
-        state.magnet_mode = MagnetMode::Strong;
+        let state = ChartState::new(series, 0.0, 0.0);
         let activation = cx.observe_window_activation(window, |this, window, cx| {
             if !window.is_window_active() {
+                // Modifier releases are not seen while inactive (cmd-tab).
+                let fx = this.state.modifiers_changed(Mods::default());
                 this.state.mouse_left();
-                cx.notify();
+                this.hovered = false;
+                this.apply_effects(fx, cx);
             }
         });
         let stats = std::env::var_os("XVIEW_FRAME_LOG")
@@ -121,6 +140,8 @@ impl ChartView {
             focus: cx.focus_handle(),
             colors,
             dragging: false,
+            hovered: false,
+            origin: Point::default(),
             size: None,
             stats,
             _activation: activation,
@@ -184,8 +205,8 @@ impl ChartView {
                 ChartEffect::DrawingsChanged => ChartViewEvent::DrawingsChanged,
                 ChartEffect::ToolFinished => ChartViewEvent::ToolFinished,
                 ChartEffect::SelectionChanged => ChartViewEvent::SelectionChanged,
-                // Not wired yet (settings dialog, last-used style persistence).
-                ChartEffect::OpenSettings(_) | ChartEffect::ToolStylesChanged => continue,
+                ChartEffect::OpenSettings(id) => ChartViewEvent::OpenSettings(id),
+                ChartEffect::ToolStylesChanged => ChartViewEvent::ToolStylesChanged,
             });
         }
         cx.notify();
@@ -196,12 +217,31 @@ impl ChartView {
         self.apply_effects(fx, cx);
     }
 
+    /// Right-click at `p` (element coordinates): selects the drawing under it
+    /// (or deselects) and asks for its context menu.
+    pub fn right_click(&mut self, p: (f32, f32), cx: &mut Context<Self>) {
+        let (id, fx) = self.state.select_at(p);
+        self.apply_effects(fx, cx);
+        if let Some(id) = id {
+            let position = self.origin + point(px(p.0), px(p.1));
+            cx.emit(ChartViewEvent::ContextMenu { id, position });
+        }
+    }
+
+    fn modifiers_changed(&mut self, m: &Modifiers, cx: &mut Context<Self>) {
+        if self.hovered || self.dragging {
+            let fx = self.state.modifiers_changed(mods(m));
+            self.apply_effects(fx, cx);
+        }
+    }
+
     /// Prepaint: syncs the size and builds the frame.
     fn prepare(
         &mut self,
         bounds: Bounds<Pixels>,
         cx: &mut Context<Self>,
     ) -> (Frame, ChartColors, ChartLayout) {
+        self.origin = bounds.origin;
         let sz = (f32::from(bounds.size.width), f32::from(bounds.size.height));
         if self.size != Some(sz) {
             self.size = Some(sz);
@@ -269,6 +309,15 @@ impl Render for ChartView {
             .on_action(cx.listener(|this, _: &Cancel, _, cx| this.key(ChartKey::Escape, cx)))
             .on_action(cx.listener(|this, _: &Undo, _, cx| this.key(ChartKey::Undo, cx)))
             .on_action(cx.listener(|this, _: &Redo, _, cx| this.key(ChartKey::Redo, cx)))
+            .on_action(cx.listener(|this, _: &CloneDrawing, _, cx| {
+                let fx = this.state.clone_selected();
+                this.apply_effects(fx, cx);
+            }))
+            // Modifier events go to the focused path, which the canvas below
+            // is not on, so the listener sits here.
+            .on_modifiers_changed(cx.listener(|this, e: &ModifiersChangedEvent, _, cx| {
+                this.modifiers_changed(&e.modifiers, cx)
+            }))
             .on_key_down(cx.listener(|_, e: &KeyDownEvent, _, cx| {
                 if let Some(letter) = type_to_search_letter(&e.keystroke) {
                     cx.stop_propagation();
@@ -738,12 +787,28 @@ fn register_input(
     }
     {
         let (view, hitbox) = (view.clone(), hitbox.clone());
+        window.on_mouse_event(move |e: &MouseDownEvent, phase, window, cx| {
+            if phase != DispatchPhase::Bubble
+                || e.button != MouseButton::Right
+                || !hitbox.is_hovered(window)
+            {
+                return;
+            }
+            let _ = view.update(cx, |this, cx| {
+                window.focus(&this.focus, cx);
+                this.right_click(rel(e.position), cx);
+            });
+        });
+    }
+    {
+        let (view, hitbox) = (view.clone(), hitbox.clone());
         window.on_mouse_event(move |e: &MouseMoveEvent, phase, window, cx| {
             if phase != DispatchPhase::Bubble {
                 return;
             }
             let hovered = hitbox.is_hovered(window);
             let _ = view.update(cx, |this, cx| {
+                this.hovered = hovered;
                 if this.dragging || hovered {
                     let pressed = e.pressed_button == Some(MouseButton::Left);
                     if !pressed {
@@ -785,6 +850,7 @@ fn register_input(
                 return;
             }
             let _ = view.update(cx, |this, cx| {
+                this.hovered = false;
                 this.state.mouse_left();
                 cx.notify();
             });

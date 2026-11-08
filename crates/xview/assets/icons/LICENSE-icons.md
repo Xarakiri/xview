@@ -31,9 +31,12 @@ They are licensed with the rest of XView under GPL-3.0-or-later.
 | list | Original (XView) |
 | lock | Original (XView brainstorm mockup) |
 | magnet | Original (XView) |
+| magnet_strong | Original (XView): the magnet with two zigzag sparks |
+| magnet_weak | Original (XView): same artwork as `magnet` |
 | measure | Original (XView brainstorm mockup) |
 | more | Original (XView) |
 | patterns | Original (XView brainstorm mockup) |
+| pencil_lock | Original (XView): pencil with a small padlock |
 | plus | Original (XView) |
 | plus_circle | Original (XView brainstorm mockup) |
 | ray | Original (XView) |
