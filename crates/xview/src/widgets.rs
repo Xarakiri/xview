@@ -140,17 +140,16 @@ pub fn menu_row(
         .child(label.into())
 }
 
-/// Places `menu` at `offset` from the origin of the element this is added
-/// to (which should be `relative()`), in a floating layer, above a
-/// window-sized transparent backdrop that closes the menu on any click.
-pub fn popover_layer(
-    offset: (f32, f32),
-    menu: impl IntoElement,
+/// A window-sized transparent layer under a popover that closes it on any
+/// left or right click outside, and keeps those clicks from the chart.
+pub fn backdrop(
     on_close: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
     window: &Window,
-) -> [AnyElement; 2] {
+) -> AnyElement {
     let vp = window.viewport_size();
-    let backdrop = deferred(
+    let on_close = std::rc::Rc::new(on_close);
+    let on_right = on_close.clone();
+    deferred(
         anchored()
             .position_mode(AnchoredPositionMode::Window)
             .position(point(px(0.), px(0.)))
@@ -160,11 +159,24 @@ pub fn popover_layer(
                     .w(vp.width)
                     .h(vp.height)
                     .occlude()
-                    .on_mouse_down(MouseButton::Left, on_close),
+                    .on_mouse_down(MouseButton::Left, move |e, w, cx| on_close(e, w, cx))
+                    .on_mouse_down(MouseButton::Right, move |e, w, cx| on_right(e, w, cx)),
             ),
     )
     .priority(1)
-    .into_any_element();
+    .into_any_element()
+}
+
+/// Places `menu` at `offset` from the origin of the element this is added
+/// to (which should be `relative()`), in a floating layer, above a
+/// window-sized transparent backdrop that closes the menu on any click.
+pub fn popover_layer(
+    offset: (f32, f32),
+    menu: impl IntoElement,
+    on_close: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
+    window: &Window,
+) -> [AnyElement; 2] {
+    let backdrop = backdrop(on_close, window);
     let menu = div()
         .absolute()
         .left(px(offset.0))

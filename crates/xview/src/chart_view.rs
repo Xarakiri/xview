@@ -11,14 +11,15 @@ use std::{
 use gpui::{
     App, Bounds, ContentMask, Context, DispatchPhase, EventEmitter, FocusHandle, Focusable, Font,
     FontStyle, FontWeight, Hitbox, HitboxBehavior, Hsla, KeyBinding, KeyDownEvent, Keystroke, Modifiers, ModifiersChangedEvent, MouseButton, MouseDownEvent,
-    MouseExitEvent, MouseMoveEvent, MouseUpEvent, PathBuilder, PinchEvent, Pixels, Point, Render,
-    ScrollDelta, ScrollEvent, SharedString, Subscription, TextRun, Window, actions, canvas, div,
+    MouseExitEvent, MouseMoveEvent, MouseUpEvent, PathBuilder, PathStyle, PinchEvent, Pixels, Point, Render,
+    ScrollDelta, ScrollEvent, SharedString, StrokeOptions, Subscription, TextRun, Window, actions, canvas, div,
     fill, point, prelude::*, px, quad, size, transparent_black,
 };
 use xv_chart::{
     ChartColors, ChartEffect, ChartKey, ChartLayout, ChartState, DEFAULT_TEXT_SIZE, Dash, Frame,
     Legend, Mods, Prim, RectF, TextAlign, clamp_span,
 };
+use lyon_tessellation::LineCap;
 use xv_drawings::DrawingId;
 use xv_core::{Candle, Series};
 
@@ -43,8 +44,13 @@ const LABEL_RADIUS: f32 = 3.0;
 const TEXT_CLAMP_PAD: f32 = 2.0;
 const HANDLE_RADIUS: f32 = 4.5;
 const HANDLE_BORDER: f32 = 1.5;
-const DASH: [f32; 2] = [4.0, 4.0];
-const DOT: [f32; 2] = [1.0, 3.0];
+/// Crosshair and last-price lines.
+const GUIDE_DASH: [f32; 2] = [4.0, 4.0];
+/// Drawing line styles. Dots have round caps, so each "on" segment paints
+/// as a dot; the dot pattern is scaled by the line width so thick dotted
+/// lines keep their gaps (a 1 px line: 2 px dots, 2 px gaps).
+const DRAWING_DASH: [f32; 2] = [6.0, 4.0];
+const DRAWING_DOT: [f32; 2] = [1.0, 3.0];
 const LEGEND_X: f32 = 10.0;
 const LEGEND_Y: f32 = 16.0;
 const LEGEND_GAP: f32 = 12.0;
@@ -84,6 +90,9 @@ pub enum ChartViewEvent {
     OpenSettings(DrawingId),
     /// `ChartState::tool_styles` changed.
     ToolStylesChanged,
+    /// Esc while a drawing-toolbar popover is open: close it instead of
+    /// deselecting.
+    DismissPopover,
 }
 
 pub struct ChartView {
@@ -98,6 +107,9 @@ pub struct ChartView {
     hovered: bool,
     /// Window position of the canvas origin, from the last prepaint.
     origin: Point<Pixels>,
+    /// A drawing-toolbar popover is open, so Esc closes it (set by the
+    /// toolbar).
+    pub popover_open: bool,
     /// Element size last passed to `ChartState::set_size`.
     size: Option<(f32, f32)>,
     stats: Option<Rc<RefCell<FrameStats>>>,
@@ -142,6 +154,7 @@ impl ChartView {
             dragging: false,
             hovered: false,
             origin: Point::default(),
+            popover_open: false,
             size: None,
             stats,
             _activation: activation,
@@ -210,6 +223,11 @@ impl ChartView {
             });
         }
         cx.notify();
+    }
+
+    /// Window position of the chart element's origin.
+    pub fn origin(&self) -> Point<Pixels> {
+        self.origin
     }
 
     fn key(&mut self, k: ChartKey, cx: &mut Context<Self>) {
@@ -306,7 +324,13 @@ impl Render for ChartView {
             .key_context(KEY_CONTEXT)
             .track_focus(&self.focus)
             .on_action(cx.listener(|this, _: &Delete, _, cx| this.key(ChartKey::Delete, cx)))
-            .on_action(cx.listener(|this, _: &Cancel, _, cx| this.key(ChartKey::Escape, cx)))
+            .on_action(cx.listener(|this, _: &Cancel, _, cx| {
+                if this.popover_open {
+                    cx.emit(ChartViewEvent::DismissPopover);
+                } else {
+                    this.key(ChartKey::Escape, cx)
+                }
+            }))
             .on_action(cx.listener(|this, _: &Undo, _, cx| this.key(ChartKey::Undo, cx)))
             .on_action(cx.listener(|this, _: &Redo, _, cx| this.key(ChartKey::Redo, cx)))
             .on_action(cx.listener(|this, _: &CloneDrawing, _, cx| {
@@ -344,6 +368,15 @@ impl Render for ChartView {
                         let Some(prepared) = prepared else { return };
                         let t0 = Instant::now();
                         paint_frame(bounds, &prepared, window, cx);
+                        // The pointer may rest on the chart since before the
+                        // first mouse move (e.g. at launch, or after a popover
+                        // closed): take the hover from the hitbox so a cmd /
+                        // shift press snaps at once. GPUI's hit test is only
+                        // current from paint on, so this is not in prepaint.
+                        // Only ever set here; moves and exits clear it.
+                        if prepared.hitbox.is_hovered(window) {
+                            let _ = paint_view.update(cx, |this, _| this.hovered = true);
+                        }
                         register_input(bounds, &prepared.hitbox, &paint_view, window);
                         if let Some(stats) = &stats {
                             let prims = prepared.frame.plot.len()
@@ -609,10 +642,22 @@ impl Painter {
             (a.1, b.1) = (c, c);
         }
         let mut builder = PathBuilder::stroke(px(width));
+        let scaled = |d: [f32; 2]| [px(d[0] * width.max(1.0)), px(d[1] * width.max(1.0))];
         match dash {
             Dash::Solid => {}
-            Dash::Dashed => builder = builder.dash_array(&[px(DASH[0]), px(DASH[1])]),
-            Dash::Dotted => builder = builder.dash_array(&[px(DOT[0]), px(DOT[1])]),
+            Dash::Guide => builder = builder.dash_array(&[px(GUIDE_DASH[0]), px(GUIDE_DASH[1])]),
+            Dash::Dashed => {
+                builder = builder.dash_array(&[px(DRAWING_DASH[0]), px(DRAWING_DASH[1])])
+            }
+            Dash::Dotted => {
+                builder = builder
+                    .with_style(PathStyle::Stroke(
+                        StrokeOptions::default()
+                            .with_line_width(width)
+                            .with_line_cap(LineCap::Round),
+                    ))
+                    .dash_array(&scaled(DRAWING_DOT));
+            }
         }
         builder.move_to(self.at(a));
         builder.line_to(self.at(b));

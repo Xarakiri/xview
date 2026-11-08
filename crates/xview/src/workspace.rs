@@ -4,7 +4,8 @@
 //!
 //! Rendering cost: the toolbars and panels are separate entities embedded as
 //! cached views, so a chart notify (every mouse move) re-renders only the
-//! chart, the style bar and this light layout shell. Each cached view
+//! chart and this light layout shell; the drawing toolbar over the chart is
+//! cached too and re-renders only when its snapshot changes. Each cached view
 //! notifies itself only when what it shows changes.
 
 use std::path::{Path, PathBuf};
@@ -30,12 +31,12 @@ use xv_store::{
 use crate::bottom_bar::BottomBar;
 use crate::chart_view::{ChartView, ChartViewEvent, CopyDrawing, PasteDrawing};
 use crate::demo;
+use crate::drawing_toolbar::{DrawingToolbar, ToolbarEvent};
 use crate::left_toolbar::LeftToolbar;
 use crate::loader::{BackfillOutcome, Loader};
 use crate::persistence::Persistence;
 use crate::symbol_search::{SearchEvent, SymbolSearch};
 use crate::side_panel::SidePanel;
-use crate::style_bar::StyleBar;
 use crate::theme::AppTheme;
 use crate::top_bar::TopBar;
 
@@ -216,7 +217,7 @@ pub struct Workspace {
     resolve: Option<Task<()>>,
     top_bar: Entity<TopBar>,
     left_toolbar: Entity<LeftToolbar>,
-    style_bar: Entity<StyleBar>,
+    drawing_toolbar: Entity<DrawingToolbar>,
     side_panel: Entity<SidePanel>,
     bottom_bar: Entity<BottomBar>,
     _subscriptions: Vec<Subscription>,
@@ -501,14 +502,19 @@ impl Workspace {
                     this.open_search(letter.clone(), window, cx)
                 }
                 ChartViewEvent::ToolStylesChanged => this.schedule_templates_save(cx),
-                ChartViewEvent::ContextMenu { id, position } => {
-                    // The menu itself comes with the settings dialog work.
-                    eprintln!("xview: context menu for drawing {} at {position:?}", id.0);
+                ChartViewEvent::ContextMenu { position, .. } => {
+                    let position = *position;
+                    this.drawing_toolbar.update(cx, |tb, cx| {
+                        tb.open_context_menu(position, window, cx)
+                    });
                 }
                 ChartViewEvent::OpenSettings(id) => {
+                    // The settings dialog comes with Task 7.
                     eprintln!("xview: open settings for drawing {}", id.0);
                 }
-                ChartViewEvent::ToolFinished | ChartViewEvent::SelectionChanged => {}
+                ChartViewEvent::ToolFinished
+                | ChartViewEvent::SelectionChanged
+                | ChartViewEvent::DismissPopover => {}
             }
         });
         if demo::autopan() {
@@ -535,7 +541,13 @@ impl Workspace {
 
         let top_bar = cx.new(|_| TopBar::new(theme.clone(), &start.symbol, start.timeframe));
         let left_toolbar = cx.new(|cx| LeftToolbar::new(chart.clone(), theme.clone(), cx));
-        let style_bar = cx.new(|_| StyleBar::new(chart.clone(), theme.clone()));
+        let drawing_toolbar = cx.new(|cx| {
+            DrawingToolbar::new(chart.clone(), theme.clone(), &templates, window, cx)
+        });
+        let toolbar_events =
+            cx.subscribe(&drawing_toolbar, |this, _, e: &ToolbarEvent, cx| {
+                this.on_toolbar_event(e, cx)
+            });
         let side_panel = cx.new(|cx| SidePanel::new(chart.clone(), theme.clone(), cx));
         let bottom_bar = cx.new(|cx| BottomBar::new(chart.clone(), theme.clone(), use_utc, cx));
 
@@ -561,10 +573,10 @@ impl Workspace {
             resolve: None,
             top_bar,
             left_toolbar,
-            style_bar,
+            drawing_toolbar,
             side_panel,
             bottom_bar,
-            _subscriptions: vec![events, quit, bounds],
+            _subscriptions: vec![events, quit, bounds, toolbar_events],
         };
         // Before opening, so a corrupt-drawings banner lands on top.
         for text in startup_banners.into_iter().chain(start.banner) {
@@ -918,6 +930,8 @@ impl Workspace {
         self.drawings_key = Some(key);
         // Copy and paste work within one symbol.
         self.clipboard = None;
+        self.drawing_toolbar
+            .update(cx, |tb, cx| tb.set_has_clipboard(false, cx));
     }
 
     fn schedule_drawings_save(&mut self, cx: &mut Context<Self>) {
@@ -983,7 +997,40 @@ impl Workspace {
     fn copy_drawing(&mut self, cx: &mut Context<Self>) {
         if let Some(d) = self.chart.read(cx).state.selected_drawing().cloned() {
             self.clipboard = Some(d);
+            self.drawing_toolbar
+                .update(cx, |tb, cx| tb.set_has_clipboard(true, cx));
         }
+    }
+
+    fn on_toolbar_event(&mut self, e: &ToolbarEvent, cx: &mut Context<Self>) {
+        match e {
+            ToolbarEvent::Copy => return self.copy_drawing(cx),
+            ToolbarEvent::Paste => return self.paste_drawing(cx),
+            ToolbarEvent::SaveTemplate { tool, name, style } => {
+                let list = self.templates.named.entry(tool.key().to_string()).or_default();
+                let t = xv_store::NamedTemplate {
+                    name: name.clone(),
+                    style: style.clone(),
+                };
+                match list.iter_mut().find(|t| t.name == *name) {
+                    Some(old) => *old = t,
+                    None => list.push(t),
+                }
+            }
+            ToolbarEvent::DeleteTemplate { tool, name } => {
+                if let Some(list) = self.templates.named.get_mut(tool.key()) {
+                    list.retain(|t| t.name != *name);
+                    if list.is_empty() {
+                        self.templates.named.remove(tool.key());
+                    }
+                }
+            }
+            ToolbarEvent::CustomColor(c) => xv_store::push_custom_color(&mut self.templates, *c),
+        }
+        let f = self.templates.clone();
+        self.drawing_toolbar
+            .update(cx, |tb, cx| tb.set_templates(&f, cx));
+        self.schedule_templates_save(cx);
     }
 
     fn paste_drawing(&mut self, cx: &mut Context<Self>) {
@@ -1081,7 +1128,7 @@ impl Workspace {
         self.top_bar.update(cx, |v, cx| v.set_theme(t.clone(), cx));
         self.left_toolbar
             .update(cx, |v, cx| v.set_theme(t.clone(), cx));
-        self.style_bar
+        self.drawing_toolbar
             .update(cx, |v, cx| v.set_theme(t.clone(), cx));
         self.side_panel
             .update(cx, |v, cx| v.set_theme(t.clone(), cx));
@@ -1223,6 +1270,23 @@ impl Workspace {
             .update(cx, |tb, cx| tb.debug_open_flyout(&name, cx));
     }
 
+    pub(crate) fn debug_open_popover(&mut self, name: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let name = name.to_string();
+        self.drawing_toolbar
+            .update(cx, |tb, cx| tb.debug_open_popover(&name, window, cx));
+    }
+
+    pub(crate) fn debug_pick_color(&mut self, color: u32, cx: &mut Context<Self>) {
+        self.drawing_toolbar
+            .update(cx, |tb, cx| tb.debug_pick_color(color, cx));
+    }
+
+    pub(crate) fn debug_save_template(&mut self, name: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let name = name.to_string();
+        self.drawing_toolbar
+            .update(cx, |tb, cx| tb.debug_save_template(&name, window, cx));
+    }
+
     pub(crate) fn debug_chart(
         &mut self,
         cx: &mut Context<Self>,
@@ -1266,7 +1330,15 @@ impl Render for Workspace {
                     .w_full()
                     .overflow_hidden()
                     .child(self.chart.clone())
-                    .child(self.style_bar.clone()),
+                    .child(
+                        self.drawing_toolbar.clone().cached(
+                            StyleRefinement::default()
+                                .absolute()
+                                .top_0()
+                                .left_0()
+                                .size_full(),
+                        ),
+                    ),
             )
             .child(
                 self.bottom_bar.clone().cached(

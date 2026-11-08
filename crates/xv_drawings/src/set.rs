@@ -161,6 +161,11 @@ impl DrawingSet {
         self.items.clear();
     }
 
+    /// Number of undo steps available.
+    pub fn undo_depth(&self) -> usize {
+        self.undo.len()
+    }
+
     pub fn begin_gesture(&mut self) {
         if self.gesture.is_none() {
             self.gesture = Some(self.items.clone());

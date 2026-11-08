@@ -18,6 +18,12 @@
 //! - `style=dotted|dashed|solid|arrow|extend|stats|text:<s>|color:RRGGBBAA`:
 //!   edit the selected drawing
 //! - `flyout=magnet|eye|trend|none`: force a left-toolbar flyout open
+//! - `popover=templates|save_as|line_color|hex|text_color|width|line_style|more|context|none`:
+//!   force a drawing-toolbar popover open (`save_as` and `hex` also open
+//!   the name / hex field)
+//! - `pickcolor=RRGGBBAA`: choose a color in the open color picker
+//! - `template=NAME`: save the selected drawing's style as a named template
+//! - `undo`, `redo`: as cmd-z / cmd-shift-z
 //! - `log`: print the chart state to stderr
 //! - `shot=NAME`: run `$XVIEW_SCRIPT_SHOT NAME` (e.g. a screenshot script)
 //! - `quit`
@@ -25,7 +31,7 @@
 use std::time::Duration;
 
 use gpui::{Context, Window};
-use xv_chart::{MagnetMode, Mods};
+use xv_chart::{ChartKey, MagnetMode, Mods};
 use xv_core::Timeframe;
 use xv_drawings::{Extend, LineEnd, LineStyle, StatsMode, Tool};
 
@@ -134,6 +140,17 @@ fn run(
         },
         "stay" => ws.debug_set_stay(arg == "on", cx),
         "flyout" => ws.debug_open_flyout(arg, cx),
+        "popover" => ws.debug_open_popover(arg, window, cx),
+        "pickcolor" => match u32::from_str_radix(arg, 16) {
+            Ok(c) => ws.debug_pick_color(c, cx),
+            Err(_) => eprintln!("xview-script: bad color {arg}"),
+        },
+        "template" => ws.debug_save_template(arg, window, cx),
+        "undo" | "redo" => ws.debug_chart(cx, |c, cx| {
+            let k = if cmd == "undo" { ChartKey::Undo } else { ChartKey::Redo };
+            let fx = c.state.key(k);
+            c.apply_effects(fx, cx);
+        }),
         "style" => {
             let arg = arg.to_string();
             ws.debug_chart(cx, |c, cx| {
@@ -209,7 +226,7 @@ fn run(
                 .flatten()
                 .map(|c| c.open_time_ms);
             eprintln!(
-                "xview-script: log symbol={} tf={} len={} first={:?} last={:?} at_x400={:?} has_older={} loading_older={} magnet={} mode={:?} stay={} tool={:?} selected={:?} drawings={:?}",
+                "xview-script: log symbol={} tf={} len={} first={:?} last={:?} at_x400={:?} has_older={} loading_older={} magnet={} mode={:?} stay={} tool={:?} selected={:?} undo_depth={} drawings={:?}",
                 s.series.symbol.id,
                 s.series.timeframe.label(),
                 cs.len(),
@@ -223,7 +240,8 @@ fn run(
                 s.stay_in_drawing_mode,
                 s.tool,
                 s.selected,
-                s.drawings.all().iter().map(|d| (&d.kind, format!("{:08X}", d.style.color))).collect::<Vec<_>>(),
+                s.drawings.undo_depth(),
+                s.drawings.all().iter().map(|d| (&d.kind, format!("{:08X}", d.style.color), format!("{:08X}", d.style.text.color), d.style.width, d.locked)).collect::<Vec<_>>(),
             );
         }),
         "shot" => {

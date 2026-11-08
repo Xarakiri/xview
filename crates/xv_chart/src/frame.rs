@@ -77,8 +77,12 @@ pub enum TextAlign {
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum Dash {
     Solid,
+    /// A drawing's dashed line style.
     Dashed,
+    /// A drawing's dotted line style.
     Dotted,
+    /// Crosshair and last-price lines.
+    Guide,
 }
 
 impl From<LineStyle> for Dash {
@@ -554,7 +558,7 @@ pub fn build_frame(i: &FrameInput) -> Frame {
             } else {
                 colors.last_price_down
             };
-            plot.line((0.0, y), (pw, y), color, 1.0, Dash::Dashed);
+            plot.line((0.0, y), (pw, y), color, 1.0, Dash::Guide);
             price_axis.text(
                 (label_x, oy + y),
                 format_price(last.close, tick),
@@ -573,8 +577,8 @@ pub fn build_frame(i: &FrameInput) -> Frame {
         if (0.0..candles.len() as f64).contains(&idx) {
             hover_idx = Some(idx as usize);
         }
-        plot.line((sx, 0.0), (sx, ph), colors.crosshair, 1.0, Dash::Dashed);
-        plot.line((0.0, cy), (pw, cy), colors.crosshair, 1.0, Dash::Dashed);
+        plot.line((sx, 0.0), (sx, ph), colors.crosshair, 1.0, Dash::Guide);
+        plot.line((0.0, cy), (pw, cy), colors.crosshair, 1.0, Dash::Guide);
         price_axis.text(
             (label_x, oy + cy),
             format_price(vp.price_of_y(cy), tick),
@@ -2232,7 +2236,7 @@ mod tests {
         assert!(
             f.plot
                 .iter()
-                .any(|p| matches!(p, Prim::Line { dash: Dash::Dashed, .. }))
+                .any(|p| matches!(p, Prim::Line { dash: Dash::Guide, .. }))
         );
         assert!(
             f.price_axis
@@ -2250,7 +2254,7 @@ mod tests {
         assert!(
             f2.plot
                 .iter()
-                .filter(|p| matches!(p, Prim::Line { dash: Dash::Dashed, .. }))
+                .filter(|p| matches!(p, Prim::Line { dash: Dash::Guide, .. }))
                 .count()
                 >= 3
         );

@@ -6556,6 +6556,7 @@ dependencies = [
  "gpui",
  "gpui_platform",
  "gpui_tokio",
+ "lyon_tessellation",
  "tempfile",
  "xv_chart",
  "xv_core",

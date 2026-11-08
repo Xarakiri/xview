@@ -1,15 +1,18 @@
 mod assets;
 mod bottom_bar;
 mod chart_view;
+mod color_picker;
+mod context_menu;
 #[cfg(debug_assertions)]
 mod debug_script;
 mod demo;
+mod drawing_toolbar;
 mod left_toolbar;
 mod loader;
 mod persistence;
 mod side_panel;
-mod style_bar;
 mod symbol_search;
+mod text_input;
 mod theme;
 mod top_bar;
 mod widgets;
